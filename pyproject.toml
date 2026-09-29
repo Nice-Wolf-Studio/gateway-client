@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gateway-client"
+version = "0.1.0"
+description = "Shared client library for services of the Wolf MCP Gateway (service contract version 1)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=13,<17",
+    "pyhpke>=0.6.5,<0.7",
+    "cryptography>=42",
+    "jsonschema>=4.18,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["gateway_client"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
