@@ -2,7 +2,8 @@
 
 Each criterion can fail. "Fake gateway" means the in-process WebSocket server the tests use
 (`tests/helpers.py`). Anchors are against `main` at `c075232`. AC 1-20 are as-built behavior;
-AC 21-23 check decided rules that apply to this library; AC 24-25 cover known gaps and fail today.
+AC 21-23 check decided rules that apply to this library. The last section is not acceptance
+criteria yet: it lists two tracked defects whose required behavior depends on open questions.
 
 ## Configuration and keys
 
@@ -10,7 +11,7 @@ AC 21-23 check decided rules that apply to this library; AC 24-25 cover known ga
 2. A `GATEWAY_BACKEND_URL` not starting with `ws://` or `wss://` raises `ConfigError` (`config.py:60-61`).
 3. With no key configured, a key is generated and its private key is written to stderr exactly once; a second `Config.load` with the printed value yields the same `kid` (`config.py:84-95`).
 4. `SERVICE_PRIVATE_KEY_FILE` pointing at a missing file creates it with mode `0600`; a second load reuses the same key (`config.py:98-112`).
-5. `repr(KeyPair)` and `repr(Config)` contain neither the private key nor the credential (`e2e.py:163-164`, `config.py:36-38`).
+5. `repr(KeyPair)` and `repr(Config)` contain neither the private key, the credential, nor the legacy token (`e2e.py:163-164`, `config.py:36-38`).
 
 ## Registration
 
@@ -18,7 +19,7 @@ AC 21-23 check decided rules that apply to this library; AC 24-25 cover known ga
 7. A declaration with a role naming an undeclared tool, a duplicate tool, or `roles_version < 1` raises `ValueError` at construction and sends nothing (`protocol.py:40-84`).
 8. After `rejected`, retries back off exponentially to a 300 s cap, the reason is logged once per change, and no legacy register is ever sent, even with `WN_BACKEND_TOKEN` set (`service.py:206-218`).
 9. When the fake gateway closes 1008 without a reply and `WN_BACKEND_TOKEN` is set, the next frame is the legacy register; without the token, no legacy frame is sent (`service.py:197-203`).
-10. `update()` with a changed role list and the same `roles_version` raises `ValueError`; an accepted update sends `tools_changed`; a rejected update raises `RegistrationRejected` and restores the previous declaration (`service.py:236-291`).
+10. `update()` with a changed role list and the same `roles_version` raises `ValueError`; with `announce=True`, an accepted update that changes tools or roles sends `tools_changed`, and one that changes resources or roles sends `resources_changed`; a rejected update raises `RegistrationRejected` and restores the previous declaration (`service.py:236-291`).
 11. Every `ping` is answered with `pong`, including before `registered` arrives (`service.py:369-370`, `407-408`).
 
 ## Calls and the caller
@@ -38,11 +39,16 @@ AC 21-23 check decided rules that apply to this library; AC 24-25 cover known ga
 
 ## Decided rules that apply here
 
-21. **Identity stays in the gateway [decided].** The library sends no user or client identity of its own and never derives `Caller` ids from tool arguments: a call whose `payload` contains `user_id`/`client_id` keys still yields `Caller` ids equal to the frame's `caller` object.
-22. **Gateway tool roles stay the outer gate [decided].** The `roles` passed to `GatewayService` appear unchanged in the register frame, and the library sends no wolf-access-specific field in it (the register frame's key set equals the nine fields in AC 6 plus `type`).
-23. **No role = no visibility, not even existence [decided].** A handler raising `ServiceError("not_found", "unknown tool: T")` produces a reply frame with the same keys, the same `code`, and the same payload as the library's own reply to an undeclared tool `T`.
+21. **Identity stays in the MCP gateway; it sends each backend call with caller `{user_id, client_id}` [decided].** The library sends no user or client identity of its own and never derives `Caller` ids from tool arguments: a call whose `payload` contains `user_id`/`client_id` keys still yields `Caller` ids equal to the frame's `caller` object.
+22. **The gateway does NOT move onto wolf-access now; it keeps the coarse tool roles [decided].** The `roles` passed to `GatewayService` appear unchanged in the register frame, and the library sends no wolf-access-specific field in it (the register frame's key set equals the nine fields in AC 6 plus `type`).
+23. **No role = no visibility, not even existence [decided].** With a declared tool `D` whose handler raises `ServiceError("not_found", "unknown tool: X")`, and an undeclared tool named `X`: in `none` mode, the reply to a call of `D` equals the library's reply to a call of `X` in every key except `request_id`. In `end-to-end` mode the two replies have the same keys and the same `code`, and their payloads decrypt to the same plaintext (each sealed envelope differs, so the envelopes themselves are not compared).
 
-## Known gaps (fail today)
+## Tracked defects pending open questions (not acceptance criteria yet)
 
-24. A v1 call frame with no `caller` object, or with `user_id` or `client_id` missing, is answered with an `error` frame and `on_call` is **not** invoked. Fails today: `on_call` runs with `user_id=None` (`service.py:535-539`). Error code pending open question Q1 in `docs/spec.md`.
-25. After a `GatewayService` restart, a `none` call from a client_id that sent an end-to-end call before the restart answers `not_allowed`. Fails today: the pin set is in memory only (`service.py:152`, `480`, `557`). Pending open question Q2.
+These are defects against gateway spec 6.2 and 7 (`mcp-gateway:specs/2026-09-28-users-clients-rbac.md`).
+Whether and how the library must change is an open question, so neither item is a pass/fail
+criterion until that question is answered. Each states the criterion it would become if the
+answer is yes [proposed].
+
+- **D1** (issue [#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2), open question Q1 in `docs/spec.md`). Today a v1 `call` or `read_resource` frame without usable caller ids runs `on_call` / `on_read` with `user_id=None, client_id=None` (`service.py:535-539`). If Q1 is answered yes, the criterion would be: a v1 `call` or `read_resource` whose `caller` is absent or not an object, or whose `caller.user_id` or `caller.client_id` is absent, `null`, or not a non-empty string, is answered with an `error` frame (code per Q1), and neither `on_call` nor `on_read` is invoked.
+- **D2** (issue [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3), open question Q2 in `docs/spec.md`). Today the set of client ids seen in end-to-end mode is in memory only (`service.py:152`, `480`, `557`), so after a restart a `none` call from such a client is accepted. If Q2 is answered yes, the criterion would be: after a `GatewayService` restart, a `none` call from a `client_id` that sent an end-to-end call before the restart answers `not_allowed`.
