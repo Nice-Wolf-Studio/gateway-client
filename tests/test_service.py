@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 import pytest
 from helpers import (
@@ -273,6 +274,113 @@ def test_logs_never_contain_arguments_results_or_credentials(caplog):
     for secret in ("ARG-SECRET-555", "RESULT-SECRET-777", "CRED-s3cr3t-value"):
         assert secret not in ours
     assert "r-1" in ours  # the request id is logged
+
+
+# --- caller ids (issue #2) ---------------------------------------------------------------
+#
+# Spec 6.2: `caller.user_id` and `caller.client_id` are always present. A v1
+# frame without both (missing, null or empty) never reaches the handler.
+
+def _strip_caller(frame, variant):
+    """`frame` with its caller ids missing, null or empty, per `variant`."""
+    frame = {**frame, "caller": dict(frame["caller"])}
+    if variant == "no caller":
+        del frame["caller"]
+    elif variant == "caller null":
+        frame["caller"] = None
+    elif variant == "caller not an object":
+        frame["caller"] = "user-1"
+    else:
+        field, how = variant.split(" ", 1)
+        if how == "missing":
+            del frame["caller"][field]
+        else:
+            frame["caller"][field] = None if how == "null" else ""
+    return frame
+
+
+NO_CALLER_IDS = ["no caller", "caller null", "caller not an object",
+                 "user_id missing", "user_id null", "user_id empty",
+                 "client_id missing", "client_id null", "client_id empty"]
+
+
+def _read(uri="svc://status", *, request_id="r-2"):
+    return {"type": "read_resource", "request_id": request_id, "contract_version": 1,
+            "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
+            "uri": uri, "encryption": "none"}
+
+
+def _assert_refused_not_allowed(reply, request_id, encryption="none"):
+    assert reply["type"] == "error"
+    assert reply["request_id"] == request_id
+    assert reply["encryption"] == encryption
+    assert reply["code"] == "not_allowed"
+    assert isinstance(reply["payload"], str)
+
+
+@pytest.mark.parametrize("variant", NO_CALLER_IDS)
+def test_v1_call_without_caller_ids_refused_before_on_call(variant):
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(caller)
+        return "should not run"
+
+    frame = _strip_caller(_call(payload={"text": "x"}), variant)
+    _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call}))
+    _assert_refused_not_allowed(replies[0], "r-1")
+    assert called == []
+
+
+@pytest.mark.parametrize("variant", NO_CALLER_IDS)
+def test_v1_read_without_caller_ids_refused_before_on_read(variant):
+    called = []
+
+    async def on_read(uri, caller):
+        called.append(caller)
+        return "should not run"
+
+    frame = _strip_caller(_read(), variant)
+    _, replies = run(_one_exchange([frame], service_kwargs={"on_read": on_read}))
+    _assert_refused_not_allowed(replies[0], "r-2")
+    assert called == []
+
+
+def test_v1_end_to_end_call_without_caller_ids_refused_before_on_call():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(caller)
+        return "should not run"
+
+    frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
+    frame = _strip_caller(frame, "no caller")
+    _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call,
+                                                            "key": service_key}))
+    _assert_refused_not_allowed(replies[0], "r-e2e", encryption="end-to-end")
+    assert called == []
+
+
+def test_refusal_without_caller_ids_logged_once_at_warning_without_payload(caplog):
+    frame = _strip_caller(_call(payload={"text": "ARG-SECRET-555"},
+                                request_id="r-no-caller"), "no caller")
+    with caplog.at_level(logging.DEBUG):
+        _, replies = run(_one_exchange([frame]))
+    assert replies[0]["code"] == "not_allowed"
+    ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    about_it = [r for r in ours if "r-no-caller" in r.getMessage()]
+    assert [r.levelno for r in about_it] == [logging.WARNING]
+    assert not any("ARG-SECRET-555" in r.getMessage() for r in ours)
+
+
+def test_caller_contract_says_fail_closed_on_legacy_none_user_id():
+    # Legacy calls reach the handler with `user_id=None` by design (see
+    # test_legacy_fallback_when_closed_1008_without_reply); the documented
+    # contract tells consumers to fail closed on it.
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    for text in (Caller.__doc__, readme):
+        assert "fail closed" in " ".join(text.split())
 
 
 # --- end-to-end ------------------------------------------------------------------------

@@ -18,7 +18,7 @@ from .errors import (
 )
 from .service import Caller, GatewayService
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "BAD_ARGUMENTS", "ERROR_CODES", "INTERNAL", "NOT_ALLOWED", "NOT_FOUND",
