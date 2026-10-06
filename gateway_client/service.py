@@ -56,13 +56,18 @@ MODE_V1 = "v1"
 MODE_LEGACY = "legacy"
 DEFAULT_MAX_FRAME_BYTES = 5 * 1024 * 1024  # the gateway's own frame limit
 DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
+UNIDENTIFIED = "caller user_id and client_id must be non-empty strings"
 
 
 @dataclass(frozen=True)
 class Caller:
     """Who is calling. In contract version 1 `user_id` and `client_id` are
-    always present; under the legacy protocol `user_id` is None and
-    `client_id` is the legacy `principal.client_id` (or None)."""
+    always present, as strings: a v1 call or read never reaches the handler
+    unless both are non-empty, non-blank strings (it is answered
+    `not_allowed`, or with the code of an earlier frame check such as an
+    unknown encryption mode). Under the legacy protocol `user_id` is None and `client_id` is
+    the legacy `principal.client_id` (or None): there is no usable identity,
+    so a consumer must fail closed (refuse) whenever `user_id` is None."""
 
     user_id: str | None
     client_id: str | None
@@ -105,6 +110,11 @@ def _parse(raw: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return frame if isinstance(frame, dict) else None
+
+
+def _is_id(value: Any) -> bool:
+    """A usable caller id: a string that is not empty or blank (spec 6.2)."""
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _close_code(exc: ConnectionClosed) -> int | None:
@@ -533,15 +543,13 @@ class GatewayService:
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
         raw_caller = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
-        caller = Caller(user_id=raw_caller.get("user_id"),
-                        client_id=raw_caller.get("client_id"),
-                        encryption=encryption if isinstance(encryption, str) else "",
-                        request_id=request_id)
+        user_id, client_id = raw_caller.get("user_id"), raw_caller.get("client_id")
         log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
                  frame.get("type"), request_id, "tool" if is_call else "uri", target,
-                 caller.user_id, caller.client_id, encryption)
+                 user_id, client_id, encryption)
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
+        unidentified = False
         try:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
@@ -550,11 +558,18 @@ class GatewayService:
                 client_key = self._client_key(frame)
                 service = frame.get("service")
                 fields = e2e.header(
-                    user_id=caller.user_id, client_id=caller.client_id,
+                    user_id=user_id, client_id=client_id,
                     service=service if isinstance(service, str) else self.config.service_name,
                     encryption=encryption, **({"tool": target} if is_call else {"uri": target}))
-                if caller.client_id is not None:
-                    self._pinned.add(caller.client_id)
+                if _is_id(client_id):
+                    self._pinned.add(client_id)
+            if not (_is_id(user_id) and _is_id(client_id)):
+                # Spec 6.2: both ids are always present, as strings. Without
+                # them there is no one to act for, so the handler never runs.
+                unidentified = True
+                raise ServiceError(NOT_ALLOWED, UNIDENTIFIED)
+            caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
+                            request_id=request_id)
             declared = self._check_target(is_call, target)
             if encryption == e2e.ENCRYPTION_E2E:
                 arguments = None
@@ -576,7 +591,11 @@ class GatewayService:
             log.warning("request_id=%s: handler raised %s; answering internal",
                         request_id, type(exc).__name__)
             code, message = INTERNAL, "internal error"
-        log.info("request_id=%s answered error %s", request_id, code)
+        if unidentified:
+            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
+                        request_id, message, code)
+        else:
+            log.info("request_id=%s answered error %s", request_id, code)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
 

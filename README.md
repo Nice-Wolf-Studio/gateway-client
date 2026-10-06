@@ -7,7 +7,7 @@ It replaces each service's hand-written `/backend` client and the gateway's
 `mock_backend.py` as the reference for real services.
 
 ```bash
-pip install "gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.1.0"
+pip install "gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.1.1"
 ```
 
 Python 3.10+. Depends on `websockets`, `pyhpke` (HPKE, RFC 9180),
@@ -68,12 +68,12 @@ at the first accepted registration; a different key later is `rejected` with
 |---|---|
 | Register (6.1) | Sends every required field; the declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
 | Ping | Every `ping` is answered `pong`. |
-| Call / read (6.2) | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. The request id and caller ids are logged. |
+| Call / read (6.2) | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. The request id and caller ids are logged. Unless `caller.user_id` and `caller.client_id` are both non-empty, non-blank strings, a call or read never reaches the handler. Once its encryption mode and end-to-end client key check out (a failure there keeps its own code), it is answered `not_allowed` and logged once at WARNING with its request id, never its payload. In `end-to-end` the refusal is sealed like any other error, to the ids as received, so the gateway relays the code. |
 | Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged). |
 | Changes (6) | `await service.update(tools=..., resources=..., roles=..., roles_version=...)` re-registers on the same connection and, when accepted, sends `tools_changed` / `resources_changed`. A changed role list needs a higher `roles_version`. A rejected update restores the previous declaration and raises `RegistrationRejected`. `send_tools_changed()` / `send_resources_changed()` announce on their own. |
 | End-to-end (7, 7.1) | Opens the client's envelope (HPKE Auth mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305, empty `info`), checks the arguments against the tool's `inputSchema`, and seals the result or error text to `client_public_key`. Refused: a `kid` that is not the client's (`bad_arguments`), a tampered or undecryptable envelope (`bad_arguments`), a `sent_at` more than 5 minutes off (`not_allowed`), a nonce already used by that client in the last 10 minutes (`not_allowed`). |
 | Downgrade (7) | A `none` call to anything in a role declared `requires_end_to_end`, and a `none` call from a client this process has seen in `end-to-end`, are refused `not_allowed`. |
-| Legacy fallback | If the gateway closes the connection without answering the v1 `register` (the old gateway closes 1008) **and** `WN_BACKEND_TOKEN` is set, it reconnects at once with the old register frame and serves old-style calls; the next reconnect tries v1 again. Without the token it never falls back. A `rejected` reply never falls back. |
+| Legacy fallback | If the gateway closes the connection without answering the v1 `register` (the old gateway closes 1008) **and** `WN_BACKEND_TOKEN` is set, it reconnects at once with the old register frame and serves old-style calls; the next reconnect tries v1 again. Without the token it never falls back. A `rejected` reply never falls back. A legacy call reaches the handler with `caller.user_id` None: it carries no usable identity, so a service must fail closed (refuse) whenever `user_id` is None. |
 | Reconnect | Exponential backoff with jitter, capped at 5 minutes after `rejected` and 30 seconds after a dropped connection, reset after a successful registration. The rejection reason is logged once per change. |
 | Logging | Logger `gateway_client`. Never logs arguments, results, error text, credentials or keys; the WebSocket library's frame dump is kept off (its logger, `gateway_client.transport`, stays at INFO). |
 
