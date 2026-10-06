@@ -97,10 +97,16 @@ holds no role for is refused `not_found`, the same as a name that does not exist
 | Handler error | `ServiceError(code, msg)` sends that code; any other exception sends `internal` with text `internal error`, exception text never sent or logged. | `service.py:573-581` |
 | Legacy calls | `Caller.user_id` is `None`; `client_id` comes from the legacy `principal`. | `service.py:599-624` |
 
-**Known gap** [as-built]: a v1 frame with no `caller` (or a non-object one) still runs the
-handler, with `user_id=None, client_id=None` (`service.py:535-539`). Gateway spec 6.2 says both
-are always present. Tracked in
-[#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2); see open question Q1.
+**Known gap: resolved in v0.1.1** [as-built, `main` `b4b05a2`]. At `c075232`, a v1 frame with no
+`caller` (or a non-object one) still ran the handler with `user_id=None, client_id=None`
+(`service.py:535-539` at `c075232`). Since v0.1.1 (`b4b05a2`, PR
+[#5](https://github.com/Nice-Wolf-Studio/gateway-client/pull/5), issue
+[#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2)), a v1 call or read never reaches
+the handler unless `caller.user_id` and `caller.client_id` are both non-empty, non-blank strings.
+Once its encryption mode and end-to-end client key check out (a failure there keeps its own code),
+it is answered `not_allowed`, and the refusal is logged once at WARNING with its request id, never
+its payload. Anchors at `b4b05a2`: `service.py:115-117` (`_is_id`), `566-570` (the check),
+`594-596` (the WARNING). Q1 is resolved.
 
 ### 2.5 Data
 
@@ -164,7 +170,7 @@ change (Q4).
 
 | Today [as-built] | Proposed |
 |---|---|
-| Missing `caller` runs the handler with `None` ids (`service.py:535-539`, #2). | Whether to refuse such a call before the handler is open (Q1). |
+| Missing `caller` runs the handler with `None` ids (`service.py:535-539` at `c075232`, #2). | Resolved in v0.1.1 (`b4b05a2`): refused `not_allowed` before the handler (Q1, AC 24). |
 | `Caller` carries user_id, client_id, encryption, request_id only. | Possibly an actor/sponsor field, if the gateway contract adds one (Q4). |
 | Error codes are the gateway's 6.3 set; the service picks `not_found` vs `not_allowed`. | The `not_found` answer for a resource the caller has no role on is [decided]. Whether this library documents or enforces it is [proposed] and open (Q5). |
 
@@ -187,7 +193,7 @@ arise here.
 
 ## 5. Open questions
 
-- **Q1.** Should a v1 call or read with no `caller` (or no `user_id`/`client_id`) be refused before the handler runs, and if so with which error code (`bad_arguments` or `internal`)? Tracked in #2.
+- **Q1. Resolved by v0.1.1** (`b4b05a2`, #2 closed): a v1 call or read without valid caller ids is refused before the handler runs, with `not_allowed`. Question was: should a v1 call or read with no `caller` (or no `user_id`/`client_id`) be refused before the handler runs, and if so with which error code (`bad_arguments` or `internal`)?
 - **Q2.** Should the end-to-end downgrade pin (client ids seen in end-to-end mode) survive a restart, and if so where is it stored, given the library stores nothing today? Tracked in #3.
 - **Q3.** Which of options (a), (b), (c) in 3.3 links this library to the wolf-access client, or something else?
 - **Q4.** Does the caller frame need an acting-agent / sponsor field or a consistency token for wolf-access, and if so is that a contract v2?

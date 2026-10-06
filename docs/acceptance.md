@@ -1,9 +1,10 @@
 # gateway-client: acceptance criteria
 
 Each criterion can fail. "Fake gateway" means the in-process WebSocket server the tests use
-(`tests/helpers.py`). Anchors are against `main` at `c075232`. AC 1-20 are as-built behavior;
-AC 21-23 check decided rules that apply to this library. The last section is not acceptance
-criteria yet: it lists two tracked defects whose required behavior depends on open questions.
+(`tests/helpers.py`). Anchors are against `main` at `c075232`, except AC 24, which is anchored
+at `b4b05a2` (v0.1.1). AC 1-20 and AC 24 are as-built behavior; AC 21-23 check decided rules that
+apply to this library. The last section is not acceptance criteria yet: it lists the tracked
+defect whose required behavior depends on an open question (D1 became AC 24).
 
 ## Configuration and keys
 
@@ -43,6 +44,15 @@ criteria yet: it lists two tracked defects whose required behavior depends on op
 22. **The gateway does NOT move onto wolf-access now; it keeps the coarse tool roles [decided].** The `roles` passed to `GatewayService` appear unchanged in the register frame, and the library sends no wolf-access-specific field in it (the register frame's key set equals the nine fields in AC 6 plus `type`).
 23. **No role = no visibility, not even existence [decided].** With a declared tool `D` whose handler raises `ServiceError("not_found", "unknown tool: X")`, and an undeclared tool named `X`: in `none` mode, the reply to a call of `D` equals the library's reply to a call of `X` in every key except `request_id`. In `end-to-end` mode the two replies have the same keys and the same `code`, and their payloads decrypt to the same plaintext (each sealed envelope differs, so the envelopes themselves are not compared).
 
+## Caller ids (v0.1.1)
+
+24. **(v0.1.1, `b4b05a2`; resolves #2 and Q1.)** Consider a v1 `call` or `read_resource` that names a `tool` or `uri`, with `encryption` `none`, or `end-to-end` with a valid `client_public_key` and matching `client_kid`. Two cases are tracked elsewhere: a key that cannot be sealed to is [#9](https://github.com/Nice-Wolf-Studio/gateway-client/issues/9), and an `end-to-end` frame without a `tool`/`uri` is [#10](https://github.com/Nice-Wolf-Studio/gateway-client/issues/10). If its `caller` is absent or not an object, or its `caller.user_id` or `caller.client_id` is absent, `null`, or not a non-empty, non-blank string, then:
+    - it is answered with an `error` frame with code `not_allowed`;
+    - neither `on_call` nor `on_read` is invoked;
+    - exactly one `gateway_client` log record names its `request_id` at WARNING level or above, and no record contains its payload.
+
+    It fails if any such frame reaches a handler, gets another code, or is logged at WARNING more than once. Anchors at `b4b05a2`: `service.py:115-117`, `566-570`, `594-596`. Tests: `test_v1_call_without_caller_ids_refused_before_on_call`, `test_v1_read_without_caller_ids_refused_before_on_read`, `test_refusal_without_caller_ids_logged_once_at_warning_without_payload`.
+
 ## Tracked defects pending open questions (not acceptance criteria yet)
 
 These are defects against gateway spec 6.2 and 7 (`mcp-gateway:specs/2026-09-28-users-clients-rbac.md`).
@@ -50,5 +60,5 @@ Whether and how the library must change is an open question, so neither item is 
 criterion until that question is answered. Each states the criterion it would become if the
 answer is yes [proposed].
 
-- **D1** (issue [#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2), open question Q1 in `docs/spec.md`). Today a v1 `call` or `read_resource` frame without usable caller ids runs `on_call` / `on_read` with `user_id=None, client_id=None` (`service.py:535-539`). If Q1 is answered yes, the criterion would be: a v1 `call` or `read_resource` whose `caller` is absent or not an object, or whose `caller.user_id` or `caller.client_id` is absent, `null`, or not a non-empty string, is answered with an `error` frame (code per Q1), and neither `on_call` nor `on_read` is invoked.
+- **D1: resolved.** Issue [#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2) and Q1 were resolved by v0.1.1 (`b4b05a2`) with code `not_allowed`. The criterion is now AC 24.
 - **D2** (issue [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3), open question Q2 in `docs/spec.md`). Today the set of client ids seen in end-to-end mode is in memory only (`service.py:152`, `480`, `557`), so after a restart a `none` call from such a client is accepted. If Q2 is answered yes, the criterion would be: after a `GatewayService` restart, a `none` call from a `client_id` that sent an end-to-end call before the restart answers `not_allowed`.
