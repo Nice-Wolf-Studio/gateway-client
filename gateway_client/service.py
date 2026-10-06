@@ -56,14 +56,16 @@ MODE_V1 = "v1"
 MODE_LEGACY = "legacy"
 DEFAULT_MAX_FRAME_BYTES = 5 * 1024 * 1024  # the gateway's own frame limit
 DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
+UNIDENTIFIED = "caller user_id and client_id must be non-empty strings"
 
 
 @dataclass(frozen=True)
 class Caller:
     """Who is calling. In contract version 1 `user_id` and `client_id` are
-    always present, as strings: a v1 call or read is answered `not_allowed`
-    and never reaches the handler unless both are non-empty, non-blank
-    strings. Under the legacy protocol `user_id` is None and `client_id` is
+    always present, as strings: a v1 call or read never reaches the handler
+    unless both are non-empty, non-blank strings (it is answered
+    `not_allowed`, or with the code of an earlier frame check such as an
+    unknown encryption mode). Under the legacy protocol `user_id` is None and `client_id` is
     the legacy `principal.client_id` (or None): there is no usable identity,
     so a consumer must fail closed (refuse) whenever `user_id` is None."""
 
@@ -565,8 +567,7 @@ class GatewayService:
                 # Spec 6.2: both ids are always present, as strings. Without
                 # them there is no one to act for, so the handler never runs.
                 unidentified = True
-                raise ServiceError(NOT_ALLOWED, "caller user_id and client_id must be "
-                                                "non-empty strings")
+                raise ServiceError(NOT_ALLOWED, UNIDENTIFIED)
             caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
                             request_id=request_id)
             declared = self._check_target(is_call, target)
@@ -591,9 +592,8 @@ class GatewayService:
                         request_id, type(exc).__name__)
             code, message = INTERNAL, "internal error"
         if unidentified:
-            log.warning("%s request_id=%s refused: caller user_id and client_id must be "
-                        "non-empty strings; answering %s", frame.get("type"), request_id,
-                        code)
+            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
+                        request_id, message, code)
         else:
             log.info("request_id=%s answered error %s", request_id, code)
         return self._reply_frame("error", request_id, encryption, message, client_key,

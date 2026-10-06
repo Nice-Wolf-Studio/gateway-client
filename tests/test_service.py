@@ -472,11 +472,14 @@ def test_refusal_with_unusable_client_key_is_not_blamed_on_the_handler(caplog):
                                 client_public_key=e2e.b64url_encode(zero),
                                 client_kid=e2e.key_id(zero)), "no caller")
     service = make_service("ws://127.0.0.1:9/backend")
+    reply = None
     with caplog.at_level(logging.DEBUG):
         try:
-            run(service._reply_v1(frame))
-        except Exception:
-            pass  # sealing to an unusable key fails; not what this test checks
+            reply = run(service._reply_v1(frame))
+        except ValueError:
+            pass  # sealing to this key fails, as for any error reply on main
+    if reply is not None:
+        assert reply["code"] == "not_allowed"
     ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
     assert not any("handler raised" in r.getMessage() for r in ours)
     assert [r.levelno for r in ours if r.levelno >= logging.WARNING] == [logging.WARNING]
