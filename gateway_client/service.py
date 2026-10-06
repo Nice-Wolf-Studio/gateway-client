@@ -542,13 +542,12 @@ class GatewayService:
         target = frame.get("tool") if is_call else frame.get("uri")
         raw_caller = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
         user_id, client_id = raw_caller.get("user_id"), raw_caller.get("client_id")
-        identified = _is_id(user_id) and _is_id(client_id)
-        if identified:
-            log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
-                     frame.get("type"), request_id, "tool" if is_call else "uri", target,
-                     user_id, client_id, encryption)
+        log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
+                 frame.get("type"), request_id, "tool" if is_call else "uri", target,
+                 user_id, client_id, encryption)
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
+        unidentified = False
         try:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
@@ -562,17 +561,12 @@ class GatewayService:
                     encryption=encryption, **({"tool": target} if is_call else {"uri": target}))
                 if _is_id(client_id):
                     self._pinned.add(client_id)
-            if not identified:
+            if not (_is_id(user_id) and _is_id(client_id)):
                 # Spec 6.2: both ids are always present, as strings. Without
                 # them there is no one to act for, so the handler never runs.
-                log.warning("%s request_id=%s %s=%s user_id=%r client_id=%r encryption=%s "
-                            "refused: caller user_id and client_id must be non-empty "
-                            "strings; answering %s", frame.get("type"), request_id,
-                            "tool" if is_call else "uri", target, user_id, client_id,
-                            encryption, NOT_ALLOWED)
-                return self._reply_frame("error", request_id, encryption,
-                                         "caller user_id and client_id are required",
-                                         client_key, fields, code=NOT_ALLOWED)
+                unidentified = True
+                raise ServiceError(NOT_ALLOWED, "caller user_id and client_id must be "
+                                                "non-empty strings")
             caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
                             request_id=request_id)
             declared = self._check_target(is_call, target)
@@ -596,7 +590,12 @@ class GatewayService:
             log.warning("request_id=%s: handler raised %s; answering internal",
                         request_id, type(exc).__name__)
             code, message = INTERNAL, "internal error"
-        log.info("request_id=%s answered error %s", request_id, code)
+        if unidentified:
+            log.warning("%s request_id=%s refused: caller user_id and client_id must be "
+                        "non-empty strings; answering %s", frame.get("type"), request_id,
+                        code)
+        else:
+            log.info("request_id=%s answered error %s", request_id, code)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
 
