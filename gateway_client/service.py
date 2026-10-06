@@ -61,11 +61,11 @@ DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
 @dataclass(frozen=True)
 class Caller:
     """Who is calling. In contract version 1 `user_id` and `client_id` are
-    always present: a v1 call or read without both (missing, null or empty)
-    is answered `not_allowed` and never reaches the handler. Under the legacy
-    protocol `user_id` is None and `client_id` is the legacy
-    `principal.client_id` (or None): there is no usable identity, so a
-    consumer must fail closed (refuse) whenever `user_id` is None."""
+    always present, as strings: a v1 call or read is answered `not_allowed`
+    and never reaches the handler unless both are non-empty, non-blank
+    strings. Under the legacy protocol `user_id` is None and `client_id` is
+    the legacy `principal.client_id` (or None): there is no usable identity,
+    so a consumer must fail closed (refuse) whenever `user_id` is None."""
 
     user_id: str | None
     client_id: str | None
@@ -110,9 +110,9 @@ def _parse(raw: Any) -> dict[str, Any] | None:
     return frame if isinstance(frame, dict) else None
 
 
-def _missing(value: Any) -> bool:
-    """A caller id the frame lacks: absent, null or empty."""
-    return value is None or value == ""
+def _is_id(value: Any) -> bool:
+    """A usable caller id: a string that is not empty or blank (spec 6.2)."""
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _close_code(exc: ConnectionClosed) -> int | None:
@@ -542,21 +542,11 @@ class GatewayService:
         target = frame.get("tool") if is_call else frame.get("uri")
         raw_caller = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
         user_id, client_id = raw_caller.get("user_id"), raw_caller.get("client_id")
-        if _missing(user_id) or _missing(client_id):
-            # Spec 6.2: both ids are always present. Without them there is
-            # no one to act for, so the handler never runs (fail closed).
-            log.warning("%s request_id=%s refused: caller user_id and client_id are "
-                        "required; answering %s", frame.get("type"), request_id,
-                        NOT_ALLOWED)
-            return self._reply_frame("error", request_id, encryption,
-                                     "caller user_id and client_id are required",
-                                     None, None, code=NOT_ALLOWED)
-        caller = Caller(user_id=user_id, client_id=client_id,
-                        encryption=encryption if isinstance(encryption, str) else "",
-                        request_id=request_id)
-        log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
-                 frame.get("type"), request_id, "tool" if is_call else "uri", target,
-                 caller.user_id, caller.client_id, encryption)
+        identified = _is_id(user_id) and _is_id(client_id)
+        if identified:
+            log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
+                     frame.get("type"), request_id, "tool" if is_call else "uri", target,
+                     user_id, client_id, encryption)
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
         try:
@@ -567,11 +557,24 @@ class GatewayService:
                 client_key = self._client_key(frame)
                 service = frame.get("service")
                 fields = e2e.header(
-                    user_id=caller.user_id, client_id=caller.client_id,
+                    user_id=user_id, client_id=client_id,
                     service=service if isinstance(service, str) else self.config.service_name,
                     encryption=encryption, **({"tool": target} if is_call else {"uri": target}))
-                if caller.client_id is not None:
-                    self._pinned.add(caller.client_id)
+                if _is_id(client_id):
+                    self._pinned.add(client_id)
+            if not identified:
+                # Spec 6.2: both ids are always present, as strings. Without
+                # them there is no one to act for, so the handler never runs.
+                log.warning("%s request_id=%s %s=%s user_id=%r client_id=%r encryption=%s "
+                            "refused: caller user_id and client_id must be non-empty "
+                            "strings; answering %s", frame.get("type"), request_id,
+                            "tool" if is_call else "uri", target, user_id, client_id,
+                            encryption, NOT_ALLOWED)
+                return self._reply_frame("error", request_id, encryption,
+                                         "caller user_id and client_id are required",
+                                         client_key, fields, code=NOT_ALLOWED)
+            caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
+                            request_id=request_id)
             declared = self._check_target(is_call, target)
             if encryption == e2e.ENCRYPTION_E2E:
                 arguments = None

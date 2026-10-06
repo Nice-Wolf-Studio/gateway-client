@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from pathlib import Path
 
@@ -31,6 +32,12 @@ def _call(tool="echo", payload=None, *, request_id="r-1", encryption="none", **e
              "tool": tool, "encryption": encryption, "payload": payload}
     frame.update(extra)
     return frame
+
+
+def _read(uri="svc://status", *, request_id="r-2"):
+    return {"type": "read_resource", "request_id": request_id, "contract_version": 1,
+            "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
+            "uri": uri, "encryption": "none"}
 
 
 async def _one_exchange(frames, *, service_kwargs=None, after_register=None):
@@ -205,10 +212,7 @@ def test_read_resource_dispatch():
         assert caller.client_id == "client-1"
         return "all good"
 
-    frame = {"type": "read_resource", "request_id": "r-2", "contract_version": 1,
-             "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
-             "uri": "svc://status", "encryption": "none"}
-    _, replies = run(_one_exchange([frame], service_kwargs={"on_read": on_read}))
+    _, replies = run(_one_exchange([_read()], service_kwargs={"on_read": on_read}))
     assert replies[0] == {"type": "result", "request_id": "r-2", "encryption": "none",
                           "payload": [{"uri": "svc://status", "mimeType": "text/plain",
                                        "text": "all good"}]}
@@ -278,11 +282,21 @@ def test_logs_never_contain_arguments_results_or_credentials(caplog):
 
 # --- caller ids (issue #2) ---------------------------------------------------------------
 #
-# Spec 6.2: `caller.user_id` and `caller.client_id` are always present. A v1
-# frame without both (missing, null or empty) never reaches the handler.
+# Spec 6.2: `caller.user_id` and `caller.client_id` are always present, as
+# strings. A v1 frame unless both are non-empty, non-blank strings never
+# reaches the handler: it is answered `not_allowed`.
+
+# One value per class of bad id; "missing" deletes the key instead.
+BAD_IDS = {"missing": None, "null": None, "empty": "", "blank": " \t ",
+           "zero": 0, "number": 123, "false": False, "true": True,
+           "empty object": {}, "object": {"id": "client-1"},
+           "empty list": [], "list": ["client-1"]}
+
 
 def _strip_caller(frame, variant):
-    """`frame` with its caller ids missing, null or empty, per `variant`."""
+    """`frame` with its caller ids missing or bad, per `variant`:
+    "no caller", "caller null", "caller not an object", or
+    "<user_id|client_id> <BAD_IDS key>"."""
     frame = {**frame, "caller": dict(frame["caller"])}
     if variant == "no caller":
         del frame["caller"]
@@ -295,19 +309,12 @@ def _strip_caller(frame, variant):
         if how == "missing":
             del frame["caller"][field]
         else:
-            frame["caller"][field] = None if how == "null" else ""
+            frame["caller"][field] = BAD_IDS[how]
     return frame
 
 
-NO_CALLER_IDS = ["no caller", "caller null", "caller not an object",
-                 "user_id missing", "user_id null", "user_id empty",
-                 "client_id missing", "client_id null", "client_id empty"]
-
-
-def _read(uri="svc://status", *, request_id="r-2"):
-    return {"type": "read_resource", "request_id": request_id, "contract_version": 1,
-            "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
-            "uri": uri, "encryption": "none"}
+NO_CALLER_IDS = ["no caller", "caller null", "caller not an object"] + [
+    f"{field} {how}" for field in ("user_id", "client_id") for how in BAD_IDS]
 
 
 def _assert_refused_not_allowed(reply, request_id, encryption="none"):
@@ -315,7 +322,6 @@ def _assert_refused_not_allowed(reply, request_id, encryption="none"):
     assert reply["request_id"] == request_id
     assert reply["encryption"] == encryption
     assert reply["code"] == "not_allowed"
-    assert isinstance(reply["payload"], str)
 
 
 @pytest.mark.parametrize("variant", NO_CALLER_IDS)
@@ -329,6 +335,7 @@ def test_v1_call_without_caller_ids_refused_before_on_call(variant):
     frame = _strip_caller(_call(payload={"text": "x"}), variant)
     _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call}))
     _assert_refused_not_allowed(replies[0], "r-1")
+    assert isinstance(replies[0]["payload"], str)
     assert called == []
 
 
@@ -343,10 +350,14 @@ def test_v1_read_without_caller_ids_refused_before_on_read(variant):
     frame = _strip_caller(_read(), variant)
     _, replies = run(_one_exchange([frame], service_kwargs={"on_read": on_read}))
     _assert_refused_not_allowed(replies[0], "r-2")
+    assert isinstance(replies[0]["payload"], str)
     assert called == []
 
 
-def test_v1_end_to_end_call_without_caller_ids_refused_before_on_call():
+@pytest.mark.parametrize("variant", ["no caller", "user_id empty", "client_id list"])
+def test_v1_end_to_end_refusal_is_sealed_to_the_client(variant):
+    # A plain payload on an end-to-end reply is replaced by `internal` at the
+    # gateway, so the refusal is sealed like every other end-to-end error.
     client, service_key = KeyPair.generate(), KeyPair.generate()
     called = []
 
@@ -355,11 +366,60 @@ def test_v1_end_to_end_call_without_caller_ids_refused_before_on_call():
         return "should not run"
 
     frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
-    frame = _strip_caller(frame, "no caller")
+    frame = _strip_caller(frame, variant)
     _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call,
                                                             "key": service_key}))
     _assert_refused_not_allowed(replies[0], "r-e2e", encryption="end-to-end")
+    sent = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
+    fields = e2e.header(user_id=sent.get("user_id"), client_id=sent.get("client_id"),
+                        service="svc", tool="echo")
+    message = _open_reply(replies[0], client, service_key, fields)
+    assert isinstance(message, str)
     assert called == []
+
+
+def test_v1_end_to_end_refusal_still_pins_its_client_id():
+    # An end-to-end frame with a client_id but no user_id is refused, yet it
+    # still pins that client: a plaintext call from it afterwards is refused.
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(caller)
+        return "should not run"
+
+    frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
+    frames = [_strip_caller(frame, "user_id empty"), _call(payload={"text": "x"})]
+    _, replies = run(_one_exchange(frames, service_kwargs={"on_call": on_call,
+                                                           "key": service_key}))
+    assert [r["code"] for r in replies] == ["not_allowed", "not_allowed"]
+    assert called == []
+
+
+@pytest.mark.parametrize("encryption", ["none", "end-to-end"])
+@pytest.mark.parametrize("variant", ["client_id list", "client_id object"])
+def test_v1_unhashable_client_id_never_reaches_the_downgrade_pin(variant, encryption,
+                                                                caplog):
+    # Before the fix a list or dict client_id reached the pin set (`add` or
+    # `in`), raised TypeError and was answered `internal` as a handler failure.
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    if encryption == "none":
+        frame = _call(payload={"text": "x"})
+    else:
+        frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
+    with caplog.at_level(logging.DEBUG):
+        _, replies = run(_one_exchange([_strip_caller(frame, variant)],
+                                       service_kwargs={"key": service_key}))
+    assert replies[0]["code"] == "not_allowed"
+    assert "TypeError" not in caplog.text
+
+
+def test_unknown_encryption_without_caller_ids_is_still_bad_arguments():
+    # The caller check runs after the encryption-mode check, as the target
+    # check did before it.
+    frame = _strip_caller(_call(payload={"text": "x"}, encryption="rot13"), "no caller")
+    _, replies = run(_one_exchange([frame]))
+    assert replies[0]["code"] == "bad_arguments"
 
 
 def test_refusal_without_caller_ids_logged_once_at_warning_without_payload(caplog):
@@ -377,9 +437,11 @@ def test_refusal_without_caller_ids_logged_once_at_warning_without_payload(caplo
 def test_caller_contract_says_fail_closed_on_legacy_none_user_id():
     # Legacy calls reach the handler with `user_id=None` by design (see
     # test_legacy_fallback_when_closed_1008_without_reply); the documented
-    # contract tells consumers to fail closed on it.
+    # contract tells consumers to fail closed on it. (`python -OO` strips
+    # docstrings, so only the README is checked there.)
     readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
-    for text in (Caller.__doc__, readme):
+    texts = [readme] if sys.flags.optimize >= 2 else [readme, Caller.__doc__]
+    for text in texts:
         assert "fail closed" in " ".join(text.split())
 
 
