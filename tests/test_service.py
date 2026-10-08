@@ -235,15 +235,16 @@ def test_unknown_code_refused_at_construction():
         ServiceError("teapot", "no")
 
 
-def test_unexpected_exception_is_internal_and_text_not_leaked(caplog):
+def test_unexpected_exception_is_internal_on_the_wire_and_logged_verbatim(caplog):
     async def on_call(tool, arguments, caller):
         raise RuntimeError("db password is hunter2")
 
     with caplog.at_level(logging.DEBUG):
         _, replies = run(_one_exchange([_call(payload={"text": "x"})],
                                        service_kwargs={"on_call": on_call}))
+    # Never sent to the client; logged in full.
     assert replies[0]["code"] == "internal" and replies[0]["payload"] == "internal error"
-    assert "hunter2" not in caplog.text
+    assert "db password is hunter2" in caplog.text
 
 
 def test_unknown_tool_is_not_found():
@@ -263,20 +264,22 @@ def test_none_call_to_requires_end_to_end_role_refused():
     assert replies[0]["code"] == "not_allowed" and called == []
 
 
-def test_logs_never_contain_arguments_results_or_credentials(caplog):
+def test_logs_carry_arguments_and_results_but_never_credentials(caplog):
+    # 0.2.0: arguments and results are logged verbatim on
+    # call.start / call.end; the credential and key never are.
     async def on_call(tool, arguments, caller):
-        return "RESULT-SECRET-777"
+        return "RESULT-VALUE-777"
 
     with caplog.at_level(logging.DEBUG):
         register, replies = run(_one_exchange(
-            [_call(payload={"text": "ARG-SECRET-555"})], service_kwargs={"on_call": on_call}))
-    assert replies[0]["payload"][0]["text"] == "RESULT-SECRET-777"
+            [_call(payload={"text": "ARG-VALUE-555"})], service_kwargs={"on_call": on_call}))
+    assert replies[0]["payload"][0]["text"] == "RESULT-VALUE-777"
     # Everything the service side logged (the fake gateway's own server log
     # is the test's, not the library's), at DEBUG, including the transport.
     ours = "\n".join(r.getMessage() for r in caplog.records
                      if not r.name.startswith("websockets.server"))
-    for secret in ("ARG-SECRET-555", "RESULT-SECRET-777", "CRED-s3cr3t-value"):
-        assert secret not in ours
+    assert "ARG-VALUE-555" in ours and "RESULT-VALUE-777" in ours
+    assert "CRED-s3cr3t-value" not in ours
     assert "r-1" in ours  # the request id is logged
 
 
@@ -440,7 +443,7 @@ def test_unknown_encryption_without_caller_ids_is_still_bad_arguments(caplog):
     with caplog.at_level(logging.INFO, logger="gateway_client"):
         _, replies = run(_one_exchange([frame]))
     assert replies[0]["code"] == "bad_arguments"
-    assert "call request_id=r-1 tool=echo" in caplog.text  # the request line
+    assert "call.start request_id=r-1 tool=echo" in caplog.text  # the request line
 
 
 @pytest.mark.parametrize("encryption", ["none", "end-to-end"])
@@ -458,10 +461,12 @@ def test_refusal_without_caller_ids_logged_once_at_warning_without_payload(encry
     assert replies[0]["code"] == "not_allowed"
     ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
     about_it = [r for r in ours if "r-no-caller" in r.getMessage()]
-    # The request line every call gets, then the refusal, once, at WARNING.
+    # call.start, then the refusal as call.end, once, at WARNING.
     assert [r.levelno for r in about_it] == [logging.INFO, logging.WARNING]
-    assert "refused" in about_it[1].getMessage()
-    assert not any("ARG-SECRET-555" in r.getMessage() for r in ours)
+    assert about_it[1].getMessage().startswith("call.end ")
+    assert "error_code=not_allowed" in about_it[1].getMessage()
+    if encryption == "end-to-end":   # never decrypted, so never logged
+        assert not any("ARG-SECRET-555" in r.getMessage() for r in ours)
 
 
 def test_refusal_with_unusable_client_key_is_not_blamed_on_the_handler(caplog):

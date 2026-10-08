@@ -16,7 +16,11 @@ falls back.
 
 Reconnects back off exponentially with jitter (`protocol.Backoff`).
 
-Never logged: arguments, results, error text, credentials, keys.
+Logging (see `logs`): every call or read is one `call.start` and one
+`call.end` record with the shared field contract. Arguments, results,
+exception messages and tracebacks are logged verbatim; end-to-end arguments
+are logged decrypted on `call.end` (the envelope as received only when it
+was never opened). The register frame (credential) and keys are not logged.
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ import inspect
 import json
 import logging
 import random
+import time
+import traceback
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable
@@ -34,7 +40,7 @@ import jsonschema
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from . import e2e
+from . import e2e, logs
 from .config import Config
 from .errors import (
     BAD_ARGUMENTS,
@@ -57,6 +63,10 @@ MODE_LEGACY = "legacy"
 DEFAULT_MAX_FRAME_BYTES = 5 * 1024 * 1024  # the gateway's own frame limit
 DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
 UNIDENTIFIED = "caller user_id and client_id must be non-empty strings"
+
+OK, TOOL_ERROR, ERROR, EXCEPTION = "ok", "tool_error", "error", "exception"
+_END_LEVEL = {OK: logging.INFO, TOOL_ERROR: logging.WARNING, ERROR: logging.WARNING,
+              EXCEPTION: logging.ERROR}
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,60 @@ def _close_code(exc: ConnectionClosed) -> int | None:
     return exc.rcvd.code if exc.rcvd is not None else None
 
 
+def _is_tool_error(value: Any) -> bool:
+    """A handler result shaped like an MCP CallToolResult with `isError: true`."""
+    return isinstance(value, dict) and value.get("isError") is True
+
+
+def _traceback_text(exc: BaseException) -> str:
+    """The full traceback of `exc`, as Python prints it."""
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+class _CallLog:
+    """The `call.start` / `call.end` pair for one call or read."""
+
+    def __init__(self, *, request_id: Any, is_call: bool, target: Any, user_id: Any,
+                 client_id: Any, service_name: str, encryption: Any) -> None:
+        self._started = time.monotonic()
+        self._is_call = is_call
+        self._encrypted = encryption != e2e.ENCRYPTION_NONE
+        self._base: dict[str, Any] = {
+            "request_id": request_id, ("tool" if is_call else "uri"): target,
+            "user_id": user_id, "client_id": client_id, "service_name": service_name,
+            "encryption": encryption}
+        self.envelope: Any = None
+        self.plain_args: Any = None
+        self.have_plain_args = False
+
+    def start(self, arguments: Any) -> None:
+        fields: dict[str, Any] = {"event": "call.start", **self._base}
+        if self._is_call:
+            if self._encrypted:
+                # Plaintext is not held yet; logged on call.end.
+                self.envelope = arguments
+            else:
+                fields["args"] = arguments
+        logs.emit(log, logging.INFO, "call.start", fields)
+
+    def end(self, outcome: str, *, payload: Any = None, error_code: str | None = None,
+            error_message: str | None = None, exc: BaseException | None = None) -> None:
+        fields: dict[str, Any] = {
+            "event": "call.end", **self._base, "outcome": outcome,
+            "error_code": error_code, "error_message": error_message,
+            "duration_ms": round((time.monotonic() - self._started) * 1000, 1),
+            "result_bytes": logs.json_bytes(payload if outcome in (OK, TOOL_ERROR)
+                                            else error_message)}
+        if outcome in (OK, TOOL_ERROR):
+            fields["result"] = payload
+        if self._is_call and self._encrypted:
+            fields["args"] = self.plain_args if self.have_plain_args else self.envelope
+        if exc is not None:
+            fields["exception"] = type(exc).__name__
+            fields["traceback"] = _traceback_text(exc)
+        logs.emit(log, _END_LEVEL[outcome], "call.end", fields)
+
+
 class GatewayService:
     """One service's connection to the gateway.
 
@@ -137,7 +201,8 @@ class GatewayService:
     Callbacks may be async or sync (sync ones run in a worker thread). A
     tool result may be a list of MCP content blocks, a string, or any JSON
     value; a read may return a list of MCP resource contents, a string, or
-    any JSON value. Raise `ServiceError(code, message)` to answer with a
+    any JSON value. A tool result that is a mapping with `isError: true` is
+    logged with outcome `tool_error` (the reply is unchanged). Raise `ServiceError(code, message)` to answer with a
     section 6.3 error; any other exception answers `internal`.
     """
 
@@ -170,6 +235,7 @@ class GatewayService:
         self._registered_event: asyncio.Event | None = None
         self._stop_event: asyncio.Event | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._attempts = 0   # connection attempts since the last registration
 
     # --- public surface ------------------------------------------------------------
 
@@ -200,6 +266,7 @@ class GatewayService:
 
     async def run(self) -> None:
         """Connect, register and serve, reconnecting until `stop()`."""
+        logs.apply_env_format()
         self._stop_event = asyncio.Event()
         self._registered_event = self._registered_event or asyncio.Event()
         last_problem: str | None = None
@@ -207,23 +274,29 @@ class GatewayService:
             attempt = await self._attempt(MODE_V1)
             if (attempt.outcome is _Outcome.NO_REPLY and self.config.legacy_token
                     and not self._stop_event.is_set()):
-                log.warning("gateway closed the connection without answering the contract "
-                            "v1 register (close code %s); falling back to the legacy "
-                            "protocol for this connection", attempt.close_code)
+                self._event(logging.WARNING, "fallback",
+                            "gateway closed the connection without answering the contract "
+                            "v1 register; falling back to the legacy protocol for this "
+                            "connection", close_code=attempt.close_code)
                 attempt = await self._attempt(MODE_LEGACY)
             if self._stop_event.is_set():
                 break
             if attempt.outcome is _Outcome.REGISTERED:
                 last_problem = None
-                log.info("connection to the gateway ended; reconnecting")
+                self._event(logging.INFO, "reconnect",
+                            "connection to the gateway ended; reconnecting")
             elif attempt.reason != last_problem:
                 last_problem = attempt.reason
                 if attempt.outcome is _Outcome.REJECTED:
-                    log.error("registration rejected: %s; retrying with backoff up to "
-                              "300 s", attempt.reason)
+                    self._event(logging.ERROR, "rejected",
+                                "registration rejected; retrying with backoff up to 300 s",
+                                reason=attempt.reason,
+                                attempt=self._attempts)
                 else:
-                    log.warning("gateway connection problem: %s; retrying with backoff "
-                                "up to 30 s", attempt.reason)
+                    self._event(logging.WARNING, "reconnect",
+                                "gateway connection problem; retrying with backoff up to "
+                                "30 s", reason=attempt.reason,
+                                attempt=self._attempts)
             delay = self._backoff.next_delay(rejected=attempt.outcome is _Outcome.REJECTED)
             await self._sleep(delay)
         await self._drain()
@@ -321,8 +394,10 @@ class GatewayService:
 
     async def _attempt(self, mode: str) -> _Attempt:
         """One connection: register in `mode`, then serve until it ends."""
-        log.info("connecting to %s (%s)", self.config.url,
-                 "contract v1" if mode == MODE_V1 else "legacy protocol")
+        self._attempts += 1
+        self._event(logging.INFO, "connect",
+                    "connecting to the gateway",
+                    attempt=self._attempts, protocol=mode, url=self.config.url)
         try:
             async with connect(self.config.url, max_size=self._max_frame_bytes,
                                open_timeout=self._reply_timeout,
@@ -383,6 +458,12 @@ class GatewayService:
         except ConnectionClosed as exc:
             return None, _close_code(exc)
 
+    def _event(self, level: int, event: str, message: str, **fields: Any) -> None:
+        """A lifecycle record: `message key=value ...`, fields for JSON."""
+        logs.emit(log, level, message, {"event": event,
+                                        "service_name": self.config.service_name,
+                                        **fields})
+
     def _on_registered(self, ws: ClientConnection, mode: str) -> None:
         self._ws, self._mode = ws, mode
         self._backoff.reset()
@@ -390,14 +471,17 @@ class GatewayService:
             self._registered_event = asyncio.Event()
         self._registered_event.set()
         d = self._decl
+        counts = {"attempt": self._attempts, "protocol": mode, "tools": len(d.tools),
+                  "resources": len(d.resources)}
+        self._attempts = 0
         if mode == MODE_V1:
-            log.info("registered as service %r (contract v1): %d tool(s), %d resource(s), "
-                     "%d role(s), roles_version %d, kid %s", self.config.service_name,
-                     len(d.tools), len(d.resources), len(d.roles), d.roles_version, self.kid)
+            self._event(logging.INFO, "register",
+                        "registered (contract v1)", **counts, roles=len(d.roles),
+                        roles_version=d.roles_version, kid=self.kid)
         else:
-            log.warning("registered with the LEGACY protocol as backend_id %r: %d tool(s), "
-                        "%d resource(s); contract v1 is retried on the next reconnect",
-                        self.config.legacy_backend_id, len(d.tools), len(d.resources))
+            self._event(logging.WARNING, "register",
+                        "registered with the LEGACY protocol; contract v1 is retried on "
+                        "the next reconnect", **counts, backend_id=self.config.legacy_backend_id)
 
     def _on_disconnected(self) -> None:
         self._ws, self._mode = None, None
@@ -469,8 +553,10 @@ class GatewayService:
         try:
             await self._send(ws, reply)
         except ConnectionClosed:
-            log.warning("request_id=%s: reply not sent, the connection closed",
-                        frame.get("request_id"))
+            logs.emit(log, logging.WARNING, "call.reply_not_sent",
+                      {"event": "call.reply_not_sent", "request_id": frame.get("request_id"),
+                       "service_name": self.config.service_name,
+                       "reason": "the connection closed"})
 
     def _check_target(self, is_call: bool, target: Any) -> dict[str, Any]:
         """The declared tool or resource, else ServiceError(not_found)."""
@@ -492,16 +578,18 @@ class GatewayService:
                                             "plaintext call is refused")
 
     async def _run_handler(self, is_call: bool, target: str, declared: dict[str, Any],
-                           arguments: Any, caller: Caller) -> list[Any]:
+                           arguments: Any, caller: Caller) -> tuple[list[Any], bool]:
+        """(reply payload, whether the tool result is an `isError` one)."""
         if is_call:
             if arguments is None:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ServiceError(BAD_ARGUMENTS, "arguments must be a JSON object")
-            return content_blocks(await _invoke(self._on_call, target, arguments, caller))
+            value = await _invoke(self._on_call, target, arguments, caller)
+            return content_blocks(value), _is_tool_error(value)
         assert self._on_read is not None
         value = await _invoke(self._on_read, target, caller)
-        return resource_contents(value, target, declared.get("mimeType") or "text/plain")
+        return resource_contents(value, target, declared.get("mimeType") or "text/plain"), False
 
     @staticmethod
     def _check_schema(declared: dict[str, Any], arguments: Any) -> None:
@@ -537,19 +625,25 @@ class GatewayService:
 
     async def _reply_v1(self, frame: dict[str, Any]) -> dict[str, Any]:
         """The `result` / `error` reply to a contract v1 `call` or
-        `read_resource` (spec section 6.2)."""
+        `read_resource` (spec section 6.2), logged as `call.start` /
+        `call.end` with the request id current throughout."""
+        with logs.request_scope(frame.get("request_id")):
+            return await self._reply_v1_logged(frame)
+
+    async def _reply_v1_logged(self, frame: dict[str, Any]) -> dict[str, Any]:
         request_id = frame.get("request_id")
         encryption = frame.get("encryption")
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
         raw_caller = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
         user_id, client_id = raw_caller.get("user_id"), raw_caller.get("client_id")
-        log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
-                 frame.get("type"), request_id, "tool" if is_call else "uri", target,
-                 user_id, client_id, encryption)
+        call_log = _CallLog(request_id=request_id, is_call=is_call, target=target,
+                            user_id=user_id, client_id=client_id,
+                            service_name=self.config.service_name, encryption=encryption)
+        call_log.start(frame.get("payload"))
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
-        unidentified = False
+        failure: BaseException | None = None
         try:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
@@ -566,7 +660,6 @@ class GatewayService:
             if not (_is_id(user_id) and _is_id(client_id)):
                 # Spec 6.2: both ids are always present, as strings. Without
                 # them there is no one to act for, so the handler never runs.
-                unidentified = True
                 raise ServiceError(NOT_ALLOWED, UNIDENTIFIED)
             caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
                             request_id=request_id)
@@ -578,24 +671,25 @@ class GatewayService:
                         frame.get("payload"), recipient=self.config.key,
                         sender_public_raw=client_key, fields=fields, replay=self._replay,
                         replay_client_id=caller.client_id)
+                    call_log.plain_args, call_log.have_plain_args = arguments, True
                     self._check_schema(declared, arguments)
             else:
                 self._check_plaintext_allowed(target, caller.client_id)
                 arguments = frame.get("payload")
-            payload = await self._run_handler(is_call, target, declared, arguments, caller)
-            return self._reply_frame("result", request_id, encryption, payload,
-                                     client_key, fields)
+            payload, tool_error = await self._run_handler(is_call, target, declared,
+                                                          arguments, caller)
+            reply = self._reply_frame("result", request_id, encryption, payload,
+                                      client_key, fields)
+            call_log.end(TOOL_ERROR if tool_error else OK, payload=payload)
+            return reply
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
-        except Exception as exc:  # the service's own failure: never leak its text
-            log.warning("request_id=%s: handler raised %s; answering internal",
-                        request_id, type(exc).__name__)
-            code, message = INTERNAL, "internal error"
-        if unidentified:
-            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
-                        request_id, message, code)
+        except Exception as exc:  # the service's own failure: never sent to the client
+            code, message, failure = INTERNAL, "internal error", exc
+        if failure is not None:
+            call_log.end(EXCEPTION, error_code=code, error_message=str(failure), exc=failure)
         else:
-            log.info("request_id=%s answered error %s", request_id, code)
+            call_log.end(ERROR, error_code=code, error_message=message)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
 
@@ -618,26 +712,34 @@ class GatewayService:
     async def _reply_legacy(self, frame: dict[str, Any]) -> dict[str, Any]:
         """The reply to a legacy `call` / `read_resource`: `result {content}`,
         `resource_result {contents}` or `error {message}`."""
+        with logs.request_scope(frame.get("request_id")):
+            return await self._reply_legacy_logged(frame)
+
+    async def _reply_legacy_logged(self, frame: dict[str, Any]) -> dict[str, Any]:
         request_id = frame.get("request_id")
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
         principal = frame.get("principal") if isinstance(frame.get("principal"), dict) else {}
         caller = Caller(user_id=None, client_id=principal.get("client_id"),
                         encryption=e2e.ENCRYPTION_NONE, request_id=request_id)
-        log.info("legacy %s request_id=%s %s=%s client_id=%s", frame.get("type"),
-                 request_id, "tool" if is_call else "uri", target, caller.client_id)
+        call_log = _CallLog(request_id=request_id, is_call=is_call, target=target,
+                            user_id=None, client_id=caller.client_id,
+                            service_name=self.config.service_name,
+                            encryption=e2e.ENCRYPTION_NONE)
+        call_log.start(frame.get("arguments"))
         try:
             declared = self._check_target(is_call, target)
             self._check_plaintext_allowed(target, caller.client_id)
-            payload = await self._run_handler(is_call, target, declared,
-                                              frame.get("arguments"), caller)
+            payload, tool_error = await self._run_handler(is_call, target, declared,
+                                                          frame.get("arguments"), caller)
+            call_log.end(TOOL_ERROR if tool_error else OK, payload=payload)
             if is_call:
                 return {"type": "result", "request_id": request_id, "content": payload}
             return {"type": "resource_result", "request_id": request_id, "contents": payload}
         except ServiceError as exc:
             message = str(exc)
+            call_log.end(ERROR, error_code=exc.code, error_message=message)
         except Exception as exc:
-            log.warning("request_id=%s: handler raised %s; answering an error",
-                        request_id, type(exc).__name__)
             message = "internal error"
+            call_log.end(EXCEPTION, error_code=INTERNAL, error_message=str(exc), exc=exc)
         return {"type": "error", "request_id": request_id, "message": message}
