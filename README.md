@@ -7,7 +7,7 @@ It replaces each service's hand-written `/backend` client and the gateway's
 `mock_backend.py` as the reference for real services.
 
 ```bash
-pip install "gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.1.1"
+pip install "gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.2.0"
 ```
 
 Python 3.10+. Depends on `websockets`, `pyhpke` (HPKE, RFC 9180),
@@ -56,6 +56,7 @@ Keyword arguments to `GatewayService(...)` (`url`, `service_name`,
 | `SERVICE_PRIVATE_KEY_FILE` | File holding that key; created with mode 0600 if it does not exist. |
 | `WN_BACKEND_TOKEN` | Legacy shared token. Only enables the old-protocol fallback. |
 | `BACKEND_ID` | Legacy registry id (default `SERVICE_NAME`). |
+| `GATEWAY_LOG_FORMAT` | `json` for one JSON object per log line (ISO-8601 UTC `timestamp`). Unset or anything else: human text (the default; unchanged). |
 
 With neither key variable set, a key pair is generated and the private key is
 printed **once** to stderr with instructions. The gateway pins the public key
@@ -68,14 +69,88 @@ at the first accepted registration; a different key later is `rejected` with
 |---|---|
 | Register (6.1) | Sends every required field; the declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
 | Ping | Every `ping` is answered `pong`. |
-| Call / read (6.2) | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. The request id and caller ids are logged. Unless `caller.user_id` and `caller.client_id` are both non-empty, non-blank strings, a call or read never reaches the handler. Once its encryption mode and end-to-end client key check out (a failure there keeps its own code), it is answered `not_allowed` and logged once at WARNING with its request id, never its payload. In `end-to-end` the refusal is sealed like any other error, to the ids as received, so the gateway relays the code. |
-| Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged). |
+| Call / read (6.2) | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. Each one is logged as `call.start` and `call.end` (see Logging below). Unless `caller.user_id` and `caller.client_id` are both non-empty, non-blank strings, a call or read never reaches the handler. Once its encryption mode and end-to-end client key check out (a failure there keeps its own code), it is answered `not_allowed`, and its `call.end` is at WARNING with `error_code=not_allowed`. In `end-to-end` the refusal is sealed like any other error, to the ids as received, so the gateway relays the code. |
+| Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged; its type and traceback locations are logged). |
 | Changes (6) | `await service.update(tools=..., resources=..., roles=..., roles_version=...)` re-registers on the same connection and, when accepted, sends `tools_changed` / `resources_changed`. A changed role list needs a higher `roles_version`. A rejected update restores the previous declaration and raises `RegistrationRejected`. `send_tools_changed()` / `send_resources_changed()` announce on their own. |
 | End-to-end (7, 7.1) | Opens the client's envelope (HPKE Auth mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305, empty `info`), checks the arguments against the tool's `inputSchema`, and seals the result or error text to `client_public_key`. Refused: a `kid` that is not the client's (`bad_arguments`), a tampered or undecryptable envelope (`bad_arguments`), a `sent_at` more than 5 minutes off (`not_allowed`), a nonce already used by that client in the last 10 minutes (`not_allowed`). |
 | Downgrade (7) | A `none` call to anything in a role declared `requires_end_to_end`, and a `none` call from a client this process has seen in `end-to-end`, are refused `not_allowed`. |
 | Legacy fallback | If the gateway closes the connection without answering the v1 `register` (the old gateway closes 1008) **and** `WN_BACKEND_TOKEN` is set, it reconnects at once with the old register frame and serves old-style calls; the next reconnect tries v1 again. Without the token it never falls back. A `rejected` reply never falls back. A legacy call reaches the handler with `caller.user_id` None: it carries no usable identity, so a service must fail closed (refuse) whenever `user_id` is None. |
 | Reconnect | Exponential backoff with jitter, capped at 5 minutes after `rejected` and 30 seconds after a dropped connection, reset after a successful registration. The rejection reason is logged once per change. |
-| Logging | Logger `gateway_client`. Never logs arguments, results, error text, credentials or keys; the WebSocket library's frame dump is kept off (its logger, `gateway_client.transport`, stays at INFO). |
+| Logging | Logger `gateway_client`. Every call or read: one `call.start` and one `call.end` (below). Never logs credentials, private keys, envelope ciphertext or a handler exception's text; the WebSocket library's frame dump is kept off (its logger, `gateway_client.transport`, stays at INFO). |
+
+## Logging
+
+Every call or read produces exactly two records on the `gateway_client`
+logger, with one shared field contract (other Wolf services log the same
+names):
+
+| Field | On | Meaning |
+|---|---|---|
+| `event` | both | `call.start` or `call.end` |
+| `request_id` | both | the gateway's request id |
+| `tool` / `uri` | both | the tool (call) or resource uri (read) |
+| `user_id`, `client_id` | both | the caller ids as received (`user_id` null under the legacy protocol) |
+| `service_name` | both | `SERVICE_NAME` |
+| `encryption` | both | `none` or `end-to-end` |
+| `args` | start (`none`); end (`end-to-end`) | the arguments, redacted and truncated. `end-to-end`: `"[encrypted]"` on `call.start`; on `call.end` the decrypted arguments, or `"[encrypted]"` when the envelope never opened. Not on a read. |
+| `outcome` | end | `ok`; `tool_error` (the handler returned a mapping with `isError: true`; the reply itself is unchanged); `error` (answered with a section 6.3 code); `exception` (the handler raised; answered `internal`) |
+| `error_code`, `error_message` | end | the code and message sent, else null |
+| `exception`, `traceback` | end (`exception`) | the exception's type and its innermost frames as `file:line in func`, never its text |
+| `duration_ms` | end | receipt of the frame to the reply being ready |
+| `result_bytes` | end | size of the reply payload as JSON, before any sealing |
+| `result` | end (`ok`, `tool_error`) | the reply payload (content blocks or resource contents), redacted and truncated, before any sealing |
+| `args_truncated`, `result_truncated` | when true | something in that value was cut |
+
+Levels: `call.start` INFO; `call.end` INFO for `ok`, WARNING for `tool_error`
+and `error`, ERROR for `exception`.
+
+Redaction and truncation (`gateway_client.logs.sanitize`): any mapping key
+with a word `password`, `token`, `secret`, `key`, `credential(s)`,
+`authorization` or `cookie` (any case, any depth; `api_key`, `apiKey`,
+`X-Api-Key`, `csrftoken` match, `keyword`, `max_tokens` do not) has its
+value replaced by `"[REDACTED]"`; a string over 2000 characters is cut with
+`...[truncated N chars]`; a value whose JSON is over 8 KB becomes
+`{"truncated": true, "bytes": N, "preview": "<first 8 KB>"}`.
+
+Text (default):
+
+```
+2026-10-08T13:39:38.737Z INFO gateway_client call.start request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none args={"text":"https://img.example/x.png","token":"[REDACTED]"}
+2026-10-08T13:39:38.737Z INFO gateway_client call.end request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none outcome=ok duration_ms=0.1 result_bytes=60 result=[{"type":"text","text":"echo:https://img.example/x.png"}]
+```
+
+`GATEWAY_LOG_FORMAT=json`:
+
+```
+{"timestamp":"2026-10-08T13:39:38.901Z","level":"INFO","logger":"gateway_client","message":"call.start","event":"call.start","request_id":"r-7f3a","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","args":{"text":"https://img.example/x.png","token":"[REDACTED]"}}
+{"timestamp":"2026-10-08T13:39:38.901Z","level":"INFO","logger":"gateway_client","message":"call.end","event":"call.end","request_id":"r-7f3a","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","outcome":"ok","error_code":null,"error_message":null,"duration_ms":0.1,"result_bytes":60,"result":[{"type":"text","text":"echo:https://img.example/x.png"}]}
+```
+
+Lifecycle records carry `event` and `service_name` too: `connect`
+(`attempt`, `protocol`, `url`), `register` (`attempt`, `protocol`, counts,
+`kid`), `rejected` (`reason`, `attempt`), `reconnect` (`reason` and
+`attempt` after a problem), `fallback` (`close_code`). `attempt` counts
+connection attempts since the last accepted registration, starting at 1.
+
+Correlating the service's own logs:
+
+```python
+from gateway_client import configure_logging, current_request_id
+
+configure_logging()        # root handler; JSON when GATEWAY_LOG_FORMAT=json
+
+async def on_call(tool, arguments, caller):
+    log.info("sending")    # stamped with request_id by the filter
+    current_request_id()   # == caller.request_id, in async and sync handlers
+```
+
+`configure_logging(level=INFO, json_format=None, stream=None)` replaces the
+root handlers with one stream handler, installs `RequestIdFilter` on it and
+picks JSON or text (ISO-8601 UTC times) from `GATEWAY_LOG_FORMAT`. A service
+that keeps its own `logging.basicConfig(...)` needs no change: `run()`
+installs `RequestIdFilter` on the root handlers and, only when
+`GATEWAY_LOG_FORMAT=json`, switches them to `JsonFormatter`. Both classes are
+exported for custom setups.
 
 ### End-to-end wire details
 
