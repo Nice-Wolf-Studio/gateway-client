@@ -1,13 +1,10 @@
 """Structured, traceable logging for gateway services.
 
-What it provides:
+Logging records what the code did, verbatim: arguments, results, exception
+messages and tracebacks are logged exactly as the program holds them. Nothing
+in this module inspects a value to decide what to do with it (no redaction,
+no truncation, no pattern matching).
 
-- `sanitize(value)`: the redacted, truncated copy of a value that is safe to
-  log. Keys that look like secrets (`password`, `token`, `secret`, `key`,
-  `credential`, `authorization`, `cookie`, in any case, at any depth) become
-  `"[REDACTED]"`; a string longer than `MAX_STRING_CHARS` is cut with a
-  marker; a value whose JSON is larger than `MAX_PAYLOAD_BYTES` becomes
-  `{"truncated": true, "bytes": N, "preview": "<first 8 KB>"}`.
 - `current_request_id()`: the gateway `request_id` of the call being
   handled (None outside one). Works in async and sync (worker-thread)
   handlers.
@@ -22,7 +19,7 @@ What it provides:
 
 The library attaches its fields to a record as `gw_fields` (a dict) and its
 plain message as `gw_message`; the text form of the same record is
-`"<message> key=value ..."`.
+`"<message> key=value ..."` (a string value as is, any other value as JSON).
 """
 
 from __future__ import annotations
@@ -32,65 +29,18 @@ import contextvars
 import json
 import logging
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Iterator, Mapping
 
-REDACTED = "[REDACTED]"
-ENCRYPTED = "[encrypted]"
-MAX_STRING_CHARS = 2000
-MAX_PAYLOAD_BYTES = 8 * 1024
 LOG_FORMAT_ENV = "GATEWAY_LOG_FORMAT"
 TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
-
-# A key is secret-like when one of its words (split on non-alphanumerics and
-# camelCase) is one of these, or ends with one of the longer ones
-# ("csrftoken", "accesstoken"), or is a run-together "...key" compound.
-_SECRET_WORDS = {"password", "token", "secret", "key", "credential", "credentials",
-                 "authorization", "cookie"}
-_SECRET_SUFFIXES = ("password", "token", "secret", "credential", "credentials",
-                    "authorization", "cookie")
-_KEY_COMPOUNDS = {"apikey", "privatekey", "secretkey", "accesskey", "signingkey",
-                  "sessionkey"}
-_WORD_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 
 _request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "gateway_client_request_id", default=None)
 
 
-# --- redaction and truncation -------------------------------------------------------------
-
-def is_secret_key(name: Any) -> bool:
-    """True when a mapping key names a secret (case-insensitive)."""
-    if not isinstance(name, str):
-        return False
-    for word in _WORD_SPLIT.split(name):
-        word = word.lower()
-        if not word:
-            continue
-        if (word in _SECRET_WORDS or word in _KEY_COMPOUNDS
-                or word.endswith(_SECRET_SUFFIXES)):
-            return True
-    return False
-
-
-def _redact_and_cut(value: Any, state: list[bool]) -> Any:
-    if isinstance(value, Mapping):
-        return {str(k): (REDACTED if is_secret_key(k) else _redact_and_cut(v, state))
-                for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_redact_and_cut(v, state) for v in value]
-    if isinstance(value, str):
-        if len(value) > MAX_STRING_CHARS:
-            state[0] = True
-            return (value[:MAX_STRING_CHARS]
-                    + f"...[truncated {len(value) - MAX_STRING_CHARS} chars]")
-        return value
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return _redact_and_cut(str(value), state)
-
+# --- serialization ----------------------------------------------------------------------
 
 def to_json(value: Any) -> str:
     """Compact JSON; anything not JSON-native is stringified."""
@@ -100,18 +50,6 @@ def to_json(value: Any) -> str:
 def json_bytes(value: Any) -> int:
     """Size in bytes of `value` as compact UTF-8 JSON."""
     return len(json.dumps(value, default=str).encode())
-
-
-def sanitize(value: Any) -> tuple[Any, bool]:
-    """(safe copy of `value` for a log, whether anything was truncated).
-    Never mutates `value`."""
-    state = [False]
-    out = _redact_and_cut(value, state)
-    encoded = to_json(out).encode()
-    if len(encoded) > MAX_PAYLOAD_BYTES:
-        preview = encoded[:MAX_PAYLOAD_BYTES].decode("utf-8", errors="ignore")
-        return {"truncated": True, "bytes": len(encoded), "preview": preview}, True
-    return out, state[0]
 
 
 # --- request id ---------------------------------------------------------------------------
@@ -144,19 +82,13 @@ class RequestIdFilter(logging.Filter):
 # --- formatting ---------------------------------------------------------------------------
 
 def _kv_value(value: Any) -> str:
-    if isinstance(value, str):
-        return value if value and not re.search(r"[\s\"=]", value) else json.dumps(value)
-    return to_json(value)
+    return value if isinstance(value, str) else to_json(value)
 
 
 def text_line(message: str, fields: Mapping[str, Any]) -> str:
-    """`message key=value ...` (None values and the event itself omitted)."""
-    parts = [message]
-    for key, value in fields.items():
-        if value is None or key == "event":
-            continue
-        parts.append(f"{key}={_kv_value(value)}")
-    return " ".join(parts)
+    """`message key=value ...` for every field but `event` (the message)."""
+    return " ".join([message] + [f"{key}={_kv_value(value)}"
+                                 for key, value in fields.items() if key != "event"])
 
 
 def emit(logger: logging.Logger, level: int, message: str, fields: dict[str, Any],

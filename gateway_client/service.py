@@ -17,10 +17,10 @@ falls back.
 Reconnects back off exponentially with jitter (`protocol.Backoff`).
 
 Logging (see `logs`): every call or read is one `call.start` and one
-`call.end` record with the shared field contract; arguments and results are
-logged redacted and truncated (`logs.sanitize`), end-to-end arguments only
-once decrypted. Never logged: credentials, keys, envelope ciphertext, the
-text of an exception a handler raised.
+`call.end` record with the shared field contract. Arguments, results,
+exception messages and tracebacks are logged verbatim; end-to-end arguments
+are logged decrypted on `call.end` (the envelope as received only when it
+was never opened). The register frame (credential) and keys are not logged.
 """
 
 from __future__ import annotations
@@ -67,7 +67,6 @@ UNIDENTIFIED = "caller user_id and client_id must be non-empty strings"
 OK, TOOL_ERROR, ERROR, EXCEPTION = "ok", "tool_error", "error", "exception"
 _END_LEVEL = {OK: logging.INFO, TOOL_ERROR: logging.WARNING, ERROR: logging.WARNING,
               EXCEPTION: logging.ERROR}
-_TRACEBACK_FRAMES = 5
 
 
 @dataclass(frozen=True)
@@ -137,12 +136,9 @@ def _is_tool_error(value: Any) -> bool:
     return isinstance(value, dict) and value.get("isError") is True
 
 
-def _where(exc: BaseException) -> str:
-    """The innermost frames of `exc`'s traceback as `file:line in func`,
-    outermost first. Locations only: never the exception's text."""
-    frames = traceback.extract_tb(exc.__traceback__)[-_TRACEBACK_FRAMES:]
-    return " > ".join(f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno} in {f.name}"
-                      for f in frames)
+def _traceback_text(exc: BaseException) -> str:
+    """The full traceback of `exc`, as Python prints it."""
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 class _CallLog:
@@ -157,45 +153,35 @@ class _CallLog:
             "request_id": request_id, ("tool" if is_call else "uri"): target,
             "user_id": user_id, "client_id": client_id, "service_name": service_name,
             "encryption": encryption}
+        self.envelope: Any = None
         self.plain_args: Any = None
         self.have_plain_args = False
-
-    @staticmethod
-    def _put(fields: dict[str, Any], name: str, value: Any) -> None:
-        safe, truncated = logs.sanitize(value)
-        fields[name] = safe
-        if truncated:
-            fields[f"{name}_truncated"] = True
 
     def start(self, arguments: Any) -> None:
         fields: dict[str, Any] = {"event": "call.start", **self._base}
         if self._is_call:
             if self._encrypted:
-                fields["args"] = logs.ENCRYPTED
+                # Plaintext is not held yet; logged on call.end.
+                self.envelope = arguments
             else:
-                self._put(fields, "args", {} if arguments is None else arguments)
+                fields["args"] = arguments
         logs.emit(log, logging.INFO, "call.start", fields)
 
     def end(self, outcome: str, *, payload: Any = None, error_code: str | None = None,
             error_message: str | None = None, exc: BaseException | None = None) -> None:
         fields: dict[str, Any] = {
             "event": "call.end", **self._base, "outcome": outcome,
-            "error_code": error_code,
-            "error_message": None if error_message is None
-            else logs.sanitize(error_message)[0],
+            "error_code": error_code, "error_message": error_message,
             "duration_ms": round((time.monotonic() - self._started) * 1000, 1),
             "result_bytes": logs.json_bytes(payload if outcome in (OK, TOOL_ERROR)
                                             else error_message)}
         if outcome in (OK, TOOL_ERROR):
-            self._put(fields, "result", payload)
+            fields["result"] = payload
         if self._is_call and self._encrypted:
-            if self.have_plain_args:
-                self._put(fields, "args", self.plain_args)
-            else:
-                fields["args"] = logs.ENCRYPTED
+            fields["args"] = self.plain_args if self.have_plain_args else self.envelope
         if exc is not None:
             fields["exception"] = type(exc).__name__
-            fields["traceback"] = _where(exc)
+            fields["traceback"] = _traceback_text(exc)
         logs.emit(log, _END_LEVEL[outcome], "call.end", fields)
 
 
@@ -698,10 +684,10 @@ class GatewayService:
             return reply
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
-        except Exception as exc:  # the service's own failure: never leak its text
+        except Exception as exc:  # the service's own failure: never sent to the client
             code, message, failure = INTERNAL, "internal error", exc
         if failure is not None:
-            call_log.end(EXCEPTION, error_code=code, error_message=message, exc=failure)
+            call_log.end(EXCEPTION, error_code=code, error_message=str(failure), exc=failure)
         else:
             call_log.end(ERROR, error_code=code, error_message=message)
         return self._reply_frame("error", request_id, encryption, message, client_key,
@@ -755,5 +741,5 @@ class GatewayService:
             call_log.end(ERROR, error_code=exc.code, error_message=message)
         except Exception as exc:
             message = "internal error"
-            call_log.end(EXCEPTION, error_code=INTERNAL, error_message=message, exc=exc)
+            call_log.end(EXCEPTION, error_code=INTERNAL, error_message=str(exc), exc=exc)
         return {"type": "error", "request_id": request_id, "message": message}

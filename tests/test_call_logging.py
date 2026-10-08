@@ -15,7 +15,7 @@ from helpers import fake_gateway, make_service, recv_json, run, send_json, serve
 from test_service import _call, _e2e_call, _legacy_gateway, _one_exchange, _read
 
 from gateway_client import KeyPair, ServiceError, current_request_id
-from gateway_client.logs import REDACTED, JsonFormatter, RequestIdFilter
+from gateway_client.logs import JsonFormatter, RequestIdFilter
 
 CONTRACT = ("event", "request_id", "user_id", "client_id", "service_name", "encryption")
 END = ("outcome", "error_code", "error_message", "duration_ms", "result_bytes")
@@ -109,52 +109,78 @@ def test_not_found_is_outcome_error(caplog):
     assert end["outcome"] == "error" and end["error_code"] == "not_found"
 
 
-def test_exception_is_outcome_exception_without_its_text(caplog):
+def test_exception_logs_full_message_and_traceback_verbatim(caplog):
     async def on_call(tool, arguments, caller):
         raise RuntimeError("db password is hunter2")
 
     _, replies = _exchange(caplog, [_call(payload={"text": "x"})], on_call=on_call)
-    assert replies[0]["code"] == "internal"
+    # The wire reply never carries the exception text ...
+    assert replies[0]["code"] == "internal" and replies[0]["payload"] == "internal error"
     (end,) = _events(caplog, "call.end")
     assert end["outcome"] == "exception"
     assert end["error_code"] == "internal"
     assert end["exception"] == "RuntimeError"
-    assert "test_call_logging.py" in end["traceback"] and "on_call" in end["traceback"]
+    # ... the log does, verbatim.
+    assert end["error_message"] == "db password is hunter2"
+    tb = end["traceback"]
+    assert tb.startswith("Traceback (most recent call last):")
+    assert "test_call_logging.py" in tb and "in on_call" in tb
+    assert tb.rstrip().endswith("RuntimeError: db password is hunter2")
     assert end["_levelno"] == logging.ERROR
-    assert "hunter2" not in caplog.text
+    assert "hunter2" in end["_text"]
+
+
+def test_exception_traceback_is_full_not_capped(caplog):
+    # Eight distinct frames under the handler (more than any cap would keep).
+    def f8(): raise ValueError("deep failure in f8")
+    def f7(): f8()
+    def f6(): f7()
+    def f5(): f6()
+    def f4(): f5()
+    def f3(): f4()
+    def f2(): f3()
+    def f1(): f2()
+
+    async def on_call(tool, arguments, caller):
+        f1()
+
+    _exchange(caplog, [_call(payload={"text": "x"})], on_call=on_call)
+    (end,) = _events(caplog, "call.end")
+    for name in ("on_call", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"):
+        assert f"in {name}\n" in end["traceback"], name
+    assert end["error_message"] == "deep failure in f8"
 
 
 # --- arguments and results ---------------------------------------------------------------
 
 
-def test_secret_like_arguments_redacted_and_credential_never_logged(caplog):
-    _exchange(caplog, [_call(payload={"text": "hi", "api_token": "TOK-SECRET-1",
-                                      "nested": {"Password": "PW-SECRET-2"}})])
+def test_secret_looking_arguments_logged_verbatim(caplog):
+    args = {"text": "hi", "api_token": "TOK-1", "nested": {"Password": "PW-2"},
+            "header": "Authorization: Bearer abc.def.ghi"}
+    _exchange(caplog, [_call(payload=args)])
     (start,) = _events(caplog, "call.start")
-    assert start["args"] == {"text": "hi", "api_token": REDACTED,
-                             "nested": {"Password": REDACTED}}
-    everything = "\n".join(r.getMessage() for r in caplog.records
-                           if not r.name.startswith("websockets.server"))
-    everything += "\n".join(json.dumps(e) for e in _events(caplog))
-    for secret in ("TOK-SECRET-1", "PW-SECRET-2", "CRED-s3cr3t-value"):
-        assert secret not in everything
+    assert start["args"] == args
+    assert "TOK-1" in start["_text"] and "PW-2" in start["_text"]
 
 
-def test_long_argument_truncated_with_marker(caplog):
-    _exchange(caplog, [_call(payload={"text": "q" * 5000})])
+def test_long_argument_logged_in_full(caplog):
+    _exchange(caplog, [_call(payload={"text": "q" * 50000})])
     (start,) = _events(caplog, "call.start")
-    assert start["args_truncated"] is True
-    assert len(start["args"]["text"]) < 2100
+    assert start["args"] == {"text": "q" * 50000}
+    assert not any(k.endswith("_truncated") for k in start)
 
 
-def test_large_result_truncated_with_marker(caplog):
+def test_large_result_logged_in_full(caplog):
+    blocks = [{"type": "text", "text": "r" * 1500} for _ in range(40)]   # ~60 KB
+
     async def on_call(tool, arguments, caller):
-        return [{"type": "text", "text": "r" * 1500} for _ in range(10)]
+        return blocks
 
     _exchange(caplog, [_call(payload={"text": "x"})], on_call=on_call)
     (end,) = _events(caplog, "call.end")
-    assert end["result_truncated"] is True and end["result"]["truncated"] is True
-    assert end["result_bytes"] > 8192
+    assert end["result"] == blocks
+    assert end["result_bytes"] == len(json.dumps(blocks).encode())
+    assert not any(k.endswith("_truncated") for k in end)
 
 
 def test_read_resource_logs_uri_and_no_args(caplog):
@@ -169,32 +195,30 @@ def test_read_resource_logs_uri_and_no_args(caplog):
     assert end["outcome"] == "ok" and "all good" in json.dumps(end["result"])
 
 
-def test_e2e_start_marks_args_encrypted_end_logs_decrypted(caplog):
+def test_e2e_end_logs_decrypted_args_and_plain_result(caplog):
     client, service_key = KeyPair.generate(), KeyPair.generate()
-    frame, _ = _e2e_call(client, service_key.public_raw,
-                         {"text": "plain words", "token": "E2E-TOKEN"})
+    args = {"text": "plain words", "token": "E2E-TOKEN"}
+    frame, _ = _e2e_call(client, service_key.public_raw, args)
     _, replies = _exchange(caplog, [frame], key=service_key)
     assert replies[0]["type"] == "result"
     (start,) = _events(caplog, "call.start")
     (end,) = _events(caplog, "call.end")
-    assert start["encryption"] == "end-to-end" and start["args"] == "[encrypted]"
-    assert end["args"] == {"text": "plain words", "token": REDACTED}
+    # Plaintext is not held yet at start; the envelope is not logged since
+    # the library later decrypts it.
+    assert start["encryption"] == "end-to-end" and "args" not in start
+    assert end["args"] == args
     assert end["outcome"] == "ok"
     assert end["result"] == [{"type": "text", "text": "echo:plain words"}]
-    blob = json.dumps(_events(caplog))
-    assert frame["payload"]["ct"] not in blob          # never the envelope ciphertext
-    assert frame["payload"]["enc"] not in blob
-    assert frame["client_public_key"] not in blob
-    assert "E2E-TOKEN" not in blob
+    assert frame["payload"]["ct"] not in json.dumps(_events(caplog))
 
 
-def test_e2e_undecryptable_keeps_args_encrypted(caplog):
+def test_e2e_never_decrypted_logs_envelope_as_is(caplog):
     client, service_key = KeyPair.generate(), KeyPair.generate()
     other = KeyPair.generate()
     frame, _ = _e2e_call(client, other.public_raw, {"text": "x"})   # sealed to someone else
     _exchange(caplog, [frame], key=service_key)
     (end,) = _events(caplog, "call.end")
-    assert end["outcome"] == "error" and end["args"] == "[encrypted]"
+    assert end["outcome"] == "error" and end["args"] == frame["payload"]
 
 
 def test_unidentified_refusal_is_start_then_end_at_warning(caplog):
@@ -308,5 +332,6 @@ def test_private_keys_never_logged_even_at_debug(caplog):
     ours = "\n".join(r.getMessage() for r in caplog.records
                      if not r.name.startswith("websockets.server"))
     ours += "\n".join(json.dumps(e) for e in _events(caplog))
+    # Not a redaction: these are simply never part of what is logged.
     for secret in (service_key.private_b64(), client.private_b64(), "CRED-s3cr3t-value"):
         assert secret not in ours

@@ -235,15 +235,16 @@ def test_unknown_code_refused_at_construction():
         ServiceError("teapot", "no")
 
 
-def test_unexpected_exception_is_internal_and_text_not_leaked(caplog):
+def test_unexpected_exception_is_internal_on_the_wire_and_logged_verbatim(caplog):
     async def on_call(tool, arguments, caller):
         raise RuntimeError("db password is hunter2")
 
     with caplog.at_level(logging.DEBUG):
         _, replies = run(_one_exchange([_call(payload={"text": "x"})],
                                        service_kwargs={"on_call": on_call}))
+    # Never sent to the client; logged in full.
     assert replies[0]["code"] == "internal" and replies[0]["payload"] == "internal error"
-    assert "hunter2" not in caplog.text
+    assert "db password is hunter2" in caplog.text
 
 
 def test_unknown_tool_is_not_found():
@@ -264,7 +265,7 @@ def test_none_call_to_requires_end_to_end_role_refused():
 
 
 def test_logs_carry_arguments_and_results_but_never_credentials(caplog):
-    # 0.2.0: arguments and results are logged (redacted, truncated) on
+    # 0.2.0: arguments and results are logged verbatim on
     # call.start / call.end; the credential and key never are.
     async def on_call(tool, arguments, caller):
         return "RESULT-VALUE-777"

@@ -70,15 +70,22 @@ at the first accepted registration; a different key later is `rejected` with
 | Register (6.1) | Sends every required field; the declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
 | Ping | Every `ping` is answered `pong`. |
 | Call / read (6.2) | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. Each one is logged as `call.start` and `call.end` (see Logging below). Unless `caller.user_id` and `caller.client_id` are both non-empty, non-blank strings, a call or read never reaches the handler. Once its encryption mode and end-to-end client key check out (a failure there keeps its own code), it is answered `not_allowed`, and its `call.end` is at WARNING with `error_code=not_allowed`. In `end-to-end` the refusal is sealed like any other error, to the ids as received, so the gateway relays the code. |
-| Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged; its type and traceback locations are logged). |
+| Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` on the wire (the exception text is never sent to the client); the log has its full message and traceback. |
 | Changes (6) | `await service.update(tools=..., resources=..., roles=..., roles_version=...)` re-registers on the same connection and, when accepted, sends `tools_changed` / `resources_changed`. A changed role list needs a higher `roles_version`. A rejected update restores the previous declaration and raises `RegistrationRejected`. `send_tools_changed()` / `send_resources_changed()` announce on their own. |
 | End-to-end (7, 7.1) | Opens the client's envelope (HPKE Auth mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305, empty `info`), checks the arguments against the tool's `inputSchema`, and seals the result or error text to `client_public_key`. Refused: a `kid` that is not the client's (`bad_arguments`), a tampered or undecryptable envelope (`bad_arguments`), a `sent_at` more than 5 minutes off (`not_allowed`), a nonce already used by that client in the last 10 minutes (`not_allowed`). |
 | Downgrade (7) | A `none` call to anything in a role declared `requires_end_to_end`, and a `none` call from a client this process has seen in `end-to-end`, are refused `not_allowed`. |
 | Legacy fallback | If the gateway closes the connection without answering the v1 `register` (the old gateway closes 1008) **and** `WN_BACKEND_TOKEN` is set, it reconnects at once with the old register frame and serves old-style calls; the next reconnect tries v1 again. Without the token it never falls back. A `rejected` reply never falls back. A legacy call reaches the handler with `caller.user_id` None: it carries no usable identity, so a service must fail closed (refuse) whenever `user_id` is None. |
 | Reconnect | Exponential backoff with jitter, capped at 5 minutes after `rejected` and 30 seconds after a dropped connection, reset after a successful registration. The rejection reason is logged once per change. |
-| Logging | Logger `gateway_client`. Every call or read: one `call.start` and one `call.end` (below). Never logs credentials, private keys, envelope ciphertext or a handler exception's text; the WebSocket library's frame dump is kept off (its logger, `gateway_client.transport`, stays at INFO). |
+| Logging | Logger `gateway_client`. Every call or read: one `call.start` and one `call.end` (below), verbatim. The register frame (credential) and keys are not part of any log record; the WebSocket library's frame dump is kept off (its logger, `gateway_client.transport`, stays at INFO). |
 
 ## Logging
+
+Logging records what the code did, verbatim. Arguments, results, exception
+messages and tracebacks are logged exactly as the program holds them:
+nothing is redacted, truncated or pattern-matched, and no logging code reads
+a value to decide what to do with it. **Logs therefore contain everything a
+caller sent and a tool returned, secrets included; treat log files and log
+shipping accordingly.**
 
 Every call or read produces exactly two records on the `gateway_client`
 logger, with one shared field contract (other Wolf services log the same
@@ -92,38 +99,31 @@ names):
 | `user_id`, `client_id` | both | the caller ids as received (`user_id` null under the legacy protocol) |
 | `service_name` | both | `SERVICE_NAME` |
 | `encryption` | both | `none` or `end-to-end` |
-| `args` | start (`none`); end (`end-to-end`) | the arguments, redacted and truncated. `end-to-end`: `"[encrypted]"` on `call.start`; on `call.end` the decrypted arguments, or `"[encrypted]"` when the envelope never opened. Not on a read. |
+| `args` | start (`none`); end (`end-to-end`) | the arguments as received. `end-to-end`: not on `call.start` (no plaintext yet); on `call.end` the decrypted arguments, or the envelope as received when it was never opened. Not on a read. |
 | `outcome` | end | `ok`; `tool_error` (the handler returned a mapping with `isError: true`; the reply itself is unchanged); `error` (answered with a section 6.3 code); `exception` (the handler raised; answered `internal`) |
-| `error_code`, `error_message` | end | the code and message sent, else null |
-| `exception`, `traceback` | end (`exception`) | the exception's type and its innermost frames as `file:line in func`, never its text |
+| `error_code` | end | the code sent, else null |
+| `error_message` | end | the message sent for `error`; for `exception`, `str(exception)` (the client still gets only `internal error`); else null |
+| `exception`, `traceback` | end (`exception`) | the exception's type and its full traceback as Python prints it |
 | `duration_ms` | end | receipt of the frame to the reply being ready |
 | `result_bytes` | end | size of the reply payload as JSON, before any sealing |
-| `result` | end (`ok`, `tool_error`) | the reply payload (content blocks or resource contents), redacted and truncated, before any sealing |
-| `args_truncated`, `result_truncated` | when true | something in that value was cut |
+| `result` | end (`ok`, `tool_error`) | the reply payload (content blocks or resource contents), before any sealing |
 
 Levels: `call.start` INFO; `call.end` INFO for `ok`, WARNING for `tool_error`
 and `error`, ERROR for `exception`.
 
-Redaction and truncation (`gateway_client.logs.sanitize`): any mapping key
-with a word `password`, `token`, `secret`, `key`, `credential(s)`,
-`authorization` or `cookie` (any case, any depth; `api_key`, `apiKey`,
-`X-Api-Key`, `csrftoken` match, `keyword`, `max_tokens` do not) has its
-value replaced by `"[REDACTED]"`; a string over 2000 characters is cut with
-`...[truncated N chars]`; a value whose JSON is over 8 KB becomes
-`{"truncated": true, "bytes": N, "preview": "<first 8 KB>"}`.
-
-Text (default):
+Text (the default) is `<message> key=value ...` for every field, a string
+value as is and any other value as JSON (so a traceback spans lines):
 
 ```
-2026-10-08T13:39:38.737Z INFO gateway_client call.start request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none args={"text":"https://img.example/x.png","token":"[REDACTED]"}
-2026-10-08T13:39:38.737Z INFO gateway_client call.end request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none outcome=ok duration_ms=0.1 result_bytes=60 result=[{"type":"text","text":"echo:https://img.example/x.png"}]
+2026-10-08T13:57:23.357Z INFO gateway_client call.start request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none args={"text":"https://img.example/x.png","token":"abc"}
+2026-10-08T13:57:23.357Z INFO gateway_client call.end request_id=r-7f3a tool=echo user_id=u-42 client_id=c-claude service_name=svc encryption=none outcome=ok error_code=null error_message=null duration_ms=0.1 result_bytes=60 result=[{"type":"text","text":"echo:https://img.example/x.png"}]
 ```
 
-`GATEWAY_LOG_FORMAT=json`:
+`GATEWAY_LOG_FORMAT=json`, one object per line:
 
 ```
-{"timestamp":"2026-10-08T13:39:38.901Z","level":"INFO","logger":"gateway_client","message":"call.start","event":"call.start","request_id":"r-7f3a","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","args":{"text":"https://img.example/x.png","token":"[REDACTED]"}}
-{"timestamp":"2026-10-08T13:39:38.901Z","level":"INFO","logger":"gateway_client","message":"call.end","event":"call.end","request_id":"r-7f3a","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","outcome":"ok","error_code":null,"error_message":null,"duration_ms":0.1,"result_bytes":60,"result":[{"type":"text","text":"echo:https://img.example/x.png"}]}
+{"timestamp":"2026-10-08T13:57:23.519Z","level":"INFO","logger":"gateway_client","message":"call.start","event":"call.start","request_id":"r-7f3a","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","args":{"text":"https://img.example/x.png","token":"abc"}}
+{"timestamp":"2026-10-08T13:57:23.520Z","level":"ERROR","logger":"gateway_client","message":"call.end","event":"call.end","request_id":"r-9c1e","tool":"echo","user_id":"u-42","client_id":"c-claude","service_name":"svc","encryption":"none","outcome":"exception","error_code":"internal","error_message":"Messages.app refused chat 'Family' (AppleScript error -1743)","duration_ms":0.1,"result_bytes":62,"exception":"RuntimeError","traceback":"Traceback (most recent call last):\n  File \"/srv/svc/handler.py\", line 9, in on_call\n    raise RuntimeError(\"Messages.app refused chat 'Family' (AppleScript error -1743)\")\nRuntimeError: Messages.app refused chat 'Family' (AppleScript error -1743)\n"}
 ```
 
 Lifecycle records carry `event` and `service_name` too: `connect`
