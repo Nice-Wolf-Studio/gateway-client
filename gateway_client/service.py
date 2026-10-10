@@ -1,22 +1,24 @@
 """`GatewayService`: connect a service to the Wolf MCP Gateway.
 
 The service dials OUT to the gateway's `/backend` WebSocket, registers under
-service contract version 1 (gateway spec section 6), answers `ping`, and
-serves `call` / `read_resource` frames by invoking the service's two
-callbacks with plain arguments and a `Caller`. In `end-to-end` mode the
-library opens the client's envelope and seals the reply (see `e2e`), so the
-service code sees plain data in both modes.
+service contract version 2, answers `ping`, and serves `call` /
+`read_resource` frames by invoking the service's two callbacks with plain
+arguments and a `Caller`.
 
-Fallback: when the gateway closes the connection without answering the
-version 1 `register` (the pre-contract gateway closes with 1008 on a frame
-without `backend_token`) and `WN_BACKEND_TOKEN` is configured, the library
-reconnects at once with the legacy register frame and serves legacy calls;
-the next reconnect tries version 1 again. Without a legacy token it never
-falls back.
+Every frame's `caller_token` (GW-3) is verified before anything else
+(`caller_token.CallerTokenVerifier`): signature by `kid` against the
+gateway's key set, `aud` = this service, `exp`, the required claims, and
+`jti` not replayed. A frame whose token fails is answered `not_allowed`
+(`unavailable` when the key set could not be fetched) and no handler runs.
+The verified token is the only source of the `Caller`'s identity (INT-C3).
+
+In `end-to-end` mode the library opens the client's envelope and seals the
+reply (see `e2e`), so the service code sees plain data in both modes; the
+associated data is built from the verified token.
 
 Reconnects back off exponentially with jitter (`protocol.Backoff`).
 
-Never logged: arguments, results, error text, credentials, keys.
+Never logged: arguments, results, error text, credentials, keys, tokens.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import inspect
 import json
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -34,13 +36,15 @@ import jsonschema
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from . import e2e
+from . import caller_token, e2e
+from .caller_token import CallerTokenVerifier, KeySet, TokenRefused, VerifiedToken
 from .config import Config
 from .errors import (
     BAD_ARGUMENTS,
     INTERNAL,
     NOT_ALLOWED,
     NOT_FOUND,
+    UNAVAILABLE,
     RegistrationRejected,
     ServiceError,
 )
@@ -52,27 +56,41 @@ log = logging.getLogger("gateway_client")
 _transport_log = logging.getLogger("gateway_client.transport")
 _transport_log.setLevel(logging.INFO)
 
-MODE_V1 = "v1"
-MODE_LEGACY = "legacy"
+MODE_V2 = "v2"
 DEFAULT_MAX_FRAME_BYTES = 5 * 1024 * 1024  # the gateway's own frame limit
 DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
-UNIDENTIFIED = "caller user_id and client_id must be non-empty strings"
+TOKEN_REFUSED = "caller token refused"
+TOKEN_UNCHECKED = "caller token could not be checked; retry"
 
 
 @dataclass(frozen=True)
 class Caller:
-    """Who is calling. In contract version 1 `user_id` and `client_id` are
-    always present, as strings: a v1 call or read never reaches the handler
-    unless both are non-empty, non-blank strings (it is answered
-    `not_allowed`, or with the code of an earlier frame check such as an
-    unknown encryption mode). Under the legacy protocol `user_id` is None and `client_id` is
-    the legacy `principal.client_id` (or None): there is no usable identity,
-    so a consumer must fail closed (refuse) whenever `user_id` is None."""
+    """Who is calling, from the call's verified GW-3 caller token and
+    nothing else. A call or read reaches the handler only after its token
+    passed every check (signature, audience, expiry, required claims, no
+    replay), so `principal` and `app` are always non-blank strings.
 
-    user_id: str | None
-    client_id: str | None
+    - `principal`: the principal WRN the call acts as (the token's `sub`):
+      a user, or the agent the app acts for.
+    - `app`: the connected app's WRN (the token's `act`).
+    - `token`: the verified compact JWT, for a backend that must forward it
+      (it is short-lived and for this service only; never log it).
+    - `claims`: the verified claims (read-only).
+    """
+
+    principal: str
+    app: str
     encryption: str  # "none" or "end-to-end"
     request_id: str | None
+    token: str = field(repr=False)
+    claims: Any = field(repr=False, compare=False, default=None)
+
+    @classmethod
+    def from_token(cls, verified: VerifiedToken, *, encryption: str,
+                   request_id: str | None) -> "Caller":
+        return cls(principal=verified.principal, app=verified.app,
+                   encryption=encryption, request_id=request_id,
+                   token=verified.token, claims=verified.claims)
 
 
 OnCall = Callable[[str, dict, Caller], Any]
@@ -112,11 +130,6 @@ def _parse(raw: Any) -> dict[str, Any] | None:
     return frame if isinstance(frame, dict) else None
 
 
-def _is_id(value: Any) -> bool:
-    """A usable caller id: a string that is not empty or blank (spec 6.2)."""
-    return isinstance(value, str) and bool(value.strip())
-
-
 def _close_code(exc: ConnectionClosed) -> int | None:
     return exc.rcvd.code if exc.rcvd is not None else None
 
@@ -127,12 +140,16 @@ class GatewayService:
     Required: `tools` (each `{name, description, inputSchema}`) and
     `on_call(tool, arguments, caller) -> content`. Optional: `resources`
     (each `{uri, name, mimeType, description}`), `on_read(uri, caller) ->
-    contents`, `roles` (each `{name, description, tools, resources,
-    requires_end_to_end}`), `roles_version` (positive, only increases).
+    contents`.
 
     Configuration comes from `config`, else from keyword arguments
     (`url`, `service_name`, `credential`, `private_key`, `private_key_file`,
-    `legacy_token`, `backend_id`) over the environment (see `Config`).
+    `jwks_url`) over the environment (see `Config`).
+
+    Caller-token checks: `token_leeway` (seconds of clock skew allowed on
+    `exp`, default 10), `jwks_min_refetch_interval` (default 10 s) and
+    `jwks_max_age` (default 1 h); `jwks_fetch(url) -> dict` (sync or async)
+    replaces the HTTP fetch of the key set (for tests).
 
     Callbacks may be async or sync (sync ones run in a worker thread). A
     tool result may be a list of MCP content blocks, a string, or any JSON
@@ -143,15 +160,26 @@ class GatewayService:
 
     def __init__(self, *, tools: Iterable[dict], on_call: OnCall,
                  resources: Iterable[dict] = (), on_read: OnRead | None = None,
-                 roles: Iterable[dict] = (), roles_version: int = 1,
                  config: Config | None = None,
                  max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
                  reply_timeout: float = DEFAULT_REPLY_TIMEOUT,
                  sleep: Callable[[float], Awaitable[Any]] | None = None,
                  rand: Callable[[], float] = random.random,
+                 jwks_fetch: caller_token.Fetch | None = None,
+                 token_leeway: float = caller_token.DEFAULT_LEEWAY_SECONDS,
+                 jwks_min_refetch_interval: float = caller_token.DEFAULT_MIN_REFETCH_SECONDS,
+                 jwks_max_age: float = caller_token.DEFAULT_MAX_AGE_SECONDS,
                  **config_kwargs: Any) -> None:
+        if config is not None and config_kwargs:
+            raise TypeError("pass either config or configuration keyword arguments, "
+                            f"not both (got {', '.join(sorted(config_kwargs))})")
         self.config = config if config is not None else Config.load(**config_kwargs)
-        self._decl = Declaration.build(tools, resources, roles, roles_version)
+        self._decl = Declaration.build(tools, resources)
+        self._verifier = CallerTokenVerifier(
+            self.config.service_name,
+            KeySet(self.config.key_set_url, fetch=jwks_fetch,
+                   min_refetch_interval=jwks_min_refetch_interval, max_age=jwks_max_age),
+            leeway=token_leeway)
         self._on_call = on_call
         self._on_read = on_read
         self._max_frame_bytes = max_frame_bytes
@@ -159,7 +187,7 @@ class GatewayService:
         self._sleep_fn = sleep
         self._backoff = Backoff(rand)
         self._replay = e2e.ReplayGuard()
-        self._pinned: set[str] = set()   # client ids seen in end-to-end mode
+        self._pinned: set[str] = set()   # app WRNs seen in end-to-end mode
         self._ws: ClientConnection | None = None     # the registered connection
         self._conn: ClientConnection | None = None   # any open connection
         self._mode: str | None = None
@@ -184,8 +212,13 @@ class GatewayService:
 
     @property
     def mode(self) -> str | None:
-        """`"v1"` or `"legacy"` while registered, else None."""
+        """`"v2"` while registered, else None."""
         return self._mode
+
+    @property
+    def jwks_url(self) -> str:
+        """The key set caller tokens are checked against."""
+        return self._verifier.key_set.url
 
     @property
     def registered(self) -> bool:
@@ -204,13 +237,7 @@ class GatewayService:
         self._registered_event = self._registered_event or asyncio.Event()
         last_problem: str | None = None
         while not self._stop_event.is_set():
-            attempt = await self._attempt(MODE_V1)
-            if (attempt.outcome is _Outcome.NO_REPLY and self.config.legacy_token
-                    and not self._stop_event.is_set()):
-                log.warning("gateway closed the connection without answering the contract "
-                            "v1 register (close code %s); falling back to the legacy "
-                            "protocol for this connection", attempt.close_code)
-                attempt = await self._attempt(MODE_LEGACY)
+            attempt = await self._attempt()
             if self._stop_event.is_set():
                 break
             if attempt.outcome is _Outcome.REGISTERED:
@@ -245,41 +272,30 @@ class GatewayService:
 
     async def update(self, *, tools: Iterable[dict] | None = None,
                      resources: Iterable[dict] | None = None,
-                     roles: Iterable[dict] | None = None,
-                     roles_version: int | None = None, announce: bool = True) -> None:
+                     announce: bool = True) -> None:
         """Change what the service declares and re-register on the same
-        connection (spec section 6). When accepted and `announce` is true,
-        send `tools_changed` if the tools or roles changed and
-        `resources_changed` if the resources or roles changed.
+        connection. When accepted and `announce` is true, send
+        `tools_changed` if the tools changed and `resources_changed` if the
+        resources changed.
 
-        A changed role list needs a higher `roles_version` (ValueError
-        otherwise). If the gateway rejects the new declaration the previous
-        one is restored (used on the next reconnect) and RegistrationRejected
-        is raised. When not connected, the new declaration is used at the
-        next registration and nothing is announced. Under the legacy protocol
-        the connection is closed so the reconnect registers the new lists."""
+        If the gateway rejects the new declaration the previous one is
+        restored (used on the next reconnect) and RegistrationRejected is
+        raised. When not connected, the new declaration is used at the next
+        registration and nothing is announced."""
         async with self._update_lock:
             old = self._decl
-            new = Declaration.build(
-                old.tools if tools is None else tools,
-                old.resources if resources is None else resources,
-                old.roles if roles is None else roles,
-                old.roles_version if roles_version is None else roles_version)
-            old.check_successor(new)
-            roles_changed = new.role_set() != old.role_set()
-            tools_changed = roles_changed or list(new.tools) != list(old.tools)
-            resources_changed = roles_changed or list(new.resources) != list(old.resources)
+            new = Declaration.build(old.tools if tools is None else tools,
+                                    old.resources if resources is None else resources)
+            tools_changed = list(new.tools) != list(old.tools)
+            resources_changed = list(new.resources) != list(old.resources)
             self._decl = new
-            ws, mode = self._ws, self._mode
+            ws = self._ws
             if ws is None:
-                return
-            if mode == MODE_LEGACY:
-                await ws.close()
                 return
             future = asyncio.get_running_loop().create_future()
             self._pending_register = future
             try:
-                await self._send(ws, self._register_frame(MODE_V1))
+                await self._send(ws, self._register_frame())
                 reply = await asyncio.wait_for(future, self._reply_timeout)
             except (ConnectionClosed, ConnectionError, asyncio.TimeoutError) as exc:
                 log.warning("re-registration not confirmed (%s); the new declaration "
@@ -292,37 +308,30 @@ class GatewayService:
                 self._decl = old
                 self._rejected_on_update = reason
                 raise RegistrationRejected(reason)
-            log.info("re-registered: %d tool(s), %d resource(s), %d role(s), "
-                     "roles_version %d", len(new.tools), len(new.resources),
-                     len(new.roles), new.roles_version)
+            log.info("re-registered: %d tool(s), %d resource(s)", len(new.tools),
+                     len(new.resources))
             if announce and tools_changed:
                 await self.send_tools_changed()
             if announce and resources_changed:
                 await self.send_resources_changed()
 
     async def send_tools_changed(self) -> bool:
-        """Announce `tools_changed` (contract v1 only). False when not
-        registered under contract v1."""
+        """Announce `tools_changed`. False when not registered."""
         return await self._announce("tools_changed")
 
     async def send_resources_changed(self) -> bool:
-        """Announce `resources_changed` (contract v1 only). False when not
-        registered under contract v1."""
+        """Announce `resources_changed`. False when not registered."""
         return await self._announce("resources_changed")
 
     # --- connection ------------------------------------------------------------------
 
-    def _register_frame(self, mode: str) -> dict[str, Any]:
+    def _register_frame(self) -> dict[str, Any]:
         cfg = self.config
-        if mode == MODE_V1:
-            return self._decl.v1_register(cfg.service_name, cfg.credential,
-                                          cfg.key.public_b64)
-        return self._decl.legacy_register(cfg.legacy_token or "", cfg.legacy_backend_id)
+        return self._decl.register(cfg.service_name, cfg.credential, cfg.key.public_b64)
 
-    async def _attempt(self, mode: str) -> _Attempt:
-        """One connection: register in `mode`, then serve until it ends."""
-        log.info("connecting to %s (%s)", self.config.url,
-                 "contract v1" if mode == MODE_V1 else "legacy protocol")
+    async def _attempt(self) -> _Attempt:
+        """One connection: register, then serve until it ends."""
+        log.info("connecting to %s (contract v2)", self.config.url)
         try:
             async with connect(self.config.url, max_size=self._max_frame_bytes,
                                open_timeout=self._reply_timeout,
@@ -330,21 +339,18 @@ class GatewayService:
                 self._conn = ws
                 if self._stop_event is not None and self._stop_event.is_set():
                     return _Attempt(_Outcome.FAILED, "stopping")
-                reply, code = await self._first_reply(ws, self._register_frame(mode))
+                reply, code = await self._first_reply(ws, self._register_frame())
                 if reply is None:
                     if code == -1:
                         return _Attempt(_Outcome.FAILED, "no reply to register within "
                                         f"{self._reply_timeout:g} s")
-                    if mode == MODE_LEGACY:
-                        return _Attempt(_Outcome.REJECTED, "legacy registration refused "
-                                        f"(connection closed, code {code})", code)
                     return _Attempt(_Outcome.NO_REPLY, "connection closed without a reply "
                                     f"to register (code {code})", code)
                 if reply["type"] == "rejected":
                     return _Attempt(_Outcome.REJECTED, str(reply.get("reason")))
-                self._on_registered(ws, mode)
+                self._on_registered(ws)
                 try:
-                    await self._serve(ws, mode)
+                    await self._serve(ws)
                 finally:
                     self._on_disconnected()
                 if self._rejected_on_update is not None:
@@ -383,21 +389,16 @@ class GatewayService:
         except ConnectionClosed as exc:
             return None, _close_code(exc)
 
-    def _on_registered(self, ws: ClientConnection, mode: str) -> None:
-        self._ws, self._mode = ws, mode
+    def _on_registered(self, ws: ClientConnection) -> None:
+        self._ws, self._mode = ws, MODE_V2
         self._backoff.reset()
         if self._registered_event is None:
             self._registered_event = asyncio.Event()
         self._registered_event.set()
         d = self._decl
-        if mode == MODE_V1:
-            log.info("registered as service %r (contract v1): %d tool(s), %d resource(s), "
-                     "%d role(s), roles_version %d, kid %s", self.config.service_name,
-                     len(d.tools), len(d.resources), len(d.roles), d.roles_version, self.kid)
-        else:
-            log.warning("registered with the LEGACY protocol as backend_id %r: %d tool(s), "
-                        "%d resource(s); contract v1 is retried on the next reconnect",
-                        self.config.legacy_backend_id, len(d.tools), len(d.resources))
+        log.info("registered as service %r (contract v2): %d tool(s), %d resource(s), "
+                 "kid %s; caller tokens checked against %s", self.config.service_name,
+                 len(d.tools), len(d.resources), self.kid, self.jwks_url)
 
     def _on_disconnected(self) -> None:
         self._ws, self._mode = None, None
@@ -407,7 +408,7 @@ class GatewayService:
         if pending is not None and not pending.done():
             pending.set_exception(ConnectionError("connection closed"))
 
-    async def _serve(self, ws: ClientConnection, mode: str) -> None:
+    async def _serve(self, ws: ClientConnection) -> None:
         try:
             async for raw in ws:
                 frame = _parse(raw)
@@ -417,10 +418,10 @@ class GatewayService:
                 if ftype == "ping":
                     await self._send(ws, {"type": "pong"})
                 elif ftype in ("call", "read_resource"):
-                    task = asyncio.create_task(self._answer(ws, frame, mode))
+                    task = asyncio.create_task(self._answer(ws, frame))
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
-                elif ftype in ("registered", "rejected") and mode == MODE_V1:
+                elif ftype in ("registered", "rejected"):
                     pending = self._pending_register
                     if pending is not None and not pending.done():
                         pending.set_result(frame)
@@ -434,7 +435,7 @@ class GatewayService:
 
     async def _announce(self, ftype: str) -> bool:
         ws = self._ws
-        if ws is None or self._mode != MODE_V1:
+        if ws is None:
             return False
         await self._send(ws, {"type": ftype})
         log.info("announced %s", ftype)
@@ -463,9 +464,8 @@ class GatewayService:
 
     # --- requests --------------------------------------------------------------------
 
-    async def _answer(self, ws: ClientConnection, frame: dict[str, Any], mode: str) -> None:
-        reply = (await self._reply_v1(frame) if mode == MODE_V1
-                 else await self._reply_legacy(frame))
+    async def _answer(self, ws: ClientConnection, frame: dict[str, Any]) -> None:
+        reply = await self._reply(frame)
         try:
             await self._send(ws, reply)
         except ConnectionClosed:
@@ -481,13 +481,12 @@ class GatewayService:
             raise ServiceError(NOT_FOUND, f"unknown {noun}: {target}")
         return declared
 
-    def _check_plaintext_allowed(self, target: str, client_id: str | None) -> None:
-        """Downgrade protection (spec section 7): refuse a `none` call to
-        anything in a `requires_end_to_end` role, and any `none` call from a
-        client this process has seen in `end-to-end` mode."""
-        if target in self._decl.e2e_only():
-            raise ServiceError(NOT_ALLOWED, "this requires end-to-end encryption")
-        if client_id is not None and client_id in self._pinned:
+    def _check_plaintext_allowed(self, app: str) -> None:
+        """Downgrade protection (spec section 7): refuse a `none` call from a
+        connected app this process has seen in `end-to-end` mode. (Which
+        tools require end-to-end is wolf-access's decision under contract
+        v2; the gateway enforces it before routing.)"""
+        if app in self._pinned:
             raise ServiceError(NOT_ALLOWED, "this client uses end-to-end encryption; a "
                                             "plaintext call is refused")
 
@@ -535,41 +534,53 @@ class GatewayService:
                                               "client_public_key")
         return raw
 
-    async def _reply_v1(self, frame: dict[str, Any]) -> dict[str, Any]:
-        """The `result` / `error` reply to a contract v1 `call` or
-        `read_resource` (spec section 6.2)."""
+    async def _verify_caller(self, frame: dict[str, Any]) -> VerifiedToken:
+        """The frame's verified caller token, else ServiceError: `not_allowed`
+        for a refused token, `unavailable` when the gateway key set could
+        not be fetched. Logged once at WARNING with the reason, never the
+        token."""
+        try:
+            return await self._verifier.verify(frame.get("caller_token"))
+        except TokenRefused as exc:
+            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
+                        frame.get("request_id"), exc.reason, exc.code)
+            raise ServiceError(exc.code, TOKEN_UNCHECKED if exc.code == UNAVAILABLE
+                               else TOKEN_REFUSED) from None
+
+    async def _reply(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """The `result` / `error` reply to a `call` or `read_resource`.
+
+        Order: the caller token (nothing runs for a frame whose token fails),
+        the encryption mode, the client key (end-to-end), the target, then
+        the payload. In `end-to-end` every error after the token check is
+        sealed to the client; a token refusal is not (there is no verified
+        identity to bind the associated data to), so the gateway relays it
+        to the client as `internal`."""
         request_id = frame.get("request_id")
         encryption = frame.get("encryption")
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
-        raw_caller = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
-        user_id, client_id = raw_caller.get("user_id"), raw_caller.get("client_id")
-        log.info("%s request_id=%s %s=%s user_id=%s client_id=%s encryption=%s",
-                 frame.get("type"), request_id, "tool" if is_call else "uri", target,
-                 user_id, client_id, encryption)
+        log.info("%s request_id=%s %s=%s encryption=%s", frame.get("type"), request_id,
+                 "tool" if is_call else "uri", target, encryption)
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
-        unidentified = False
         try:
+            verified = await self._verify_caller(frame)
+            caller = Caller.from_token(verified, encryption=encryption,
+                                       request_id=request_id)
+            log.info("request_id=%s caller principal=%s app=%s", request_id,
+                     caller.principal, caller.app)
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
                 # Key and associated data first, so even a refusal is sealed.
+                # The associated data comes from the verified token only.
                 client_key = self._client_key(frame)
-                service = frame.get("service")
                 fields = e2e.header(
-                    user_id=user_id, client_id=client_id,
-                    service=service if isinstance(service, str) else self.config.service_name,
-                    encryption=encryption, **({"tool": target} if is_call else {"uri": target}))
-                if _is_id(client_id):
-                    self._pinned.add(client_id)
-            if not (_is_id(user_id) and _is_id(client_id)):
-                # Spec 6.2: both ids are always present, as strings. Without
-                # them there is no one to act for, so the handler never runs.
-                unidentified = True
-                raise ServiceError(NOT_ALLOWED, UNIDENTIFIED)
-            caller = Caller(user_id=user_id, client_id=client_id, encryption=encryption,
-                            request_id=request_id)
+                    user_id=caller.principal, client_id=caller.app,
+                    service=verified.claims["aud"], encryption=encryption,
+                    **({"tool": target} if is_call else {"uri": target}))
+                self._pinned.add(caller.app)
             declared = self._check_target(is_call, target)
             if encryption == e2e.ENCRYPTION_E2E:
                 arguments = None
@@ -577,10 +588,10 @@ class GatewayService:
                     arguments = e2e.open_envelope(
                         frame.get("payload"), recipient=self.config.key,
                         sender_public_raw=client_key, fields=fields, replay=self._replay,
-                        replay_client_id=caller.client_id)
+                        replay_client_id=caller.app)
                     self._check_schema(declared, arguments)
             else:
-                self._check_plaintext_allowed(target, caller.client_id)
+                self._check_plaintext_allowed(caller.app)
                 arguments = frame.get("payload")
             payload = await self._run_handler(is_call, target, declared, arguments, caller)
             return self._reply_frame("result", request_id, encryption, payload,
@@ -591,11 +602,7 @@ class GatewayService:
             log.warning("request_id=%s: handler raised %s; answering internal",
                         request_id, type(exc).__name__)
             code, message = INTERNAL, "internal error"
-        if unidentified:
-            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
-                        request_id, message, code)
-        else:
-            log.info("request_id=%s answered error %s", request_id, code)
+        log.info("request_id=%s answered error %s", request_id, code)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
 
@@ -603,8 +610,9 @@ class GatewayService:
                      client_key: bytes | None, fields: dict[str, Any] | None,
                      code: str | None = None) -> dict[str, Any]:
         """`{type, request_id, encryption, [code,] payload}`; in `end-to-end`
-        the payload is sealed to the client (plain only when the client's key
-        is unusable, which the gateway turns into `internal`)."""
+        the payload is sealed to the client when the client's key and the
+        verified caller are known (else plain, which the gateway turns into
+        `internal`)."""
         if encryption == e2e.ENCRYPTION_E2E and client_key is not None and fields is not None:
             payload = e2e.seal(payload, sender=self.config.key, recipient_public_raw=client_key,
                                fields=e2e.reply_header(fields, str(request_id)))
@@ -614,30 +622,3 @@ class GatewayService:
             reply["code"] = code
         reply["payload"] = payload
         return reply
-
-    async def _reply_legacy(self, frame: dict[str, Any]) -> dict[str, Any]:
-        """The reply to a legacy `call` / `read_resource`: `result {content}`,
-        `resource_result {contents}` or `error {message}`."""
-        request_id = frame.get("request_id")
-        is_call = frame.get("type") == "call"
-        target = frame.get("tool") if is_call else frame.get("uri")
-        principal = frame.get("principal") if isinstance(frame.get("principal"), dict) else {}
-        caller = Caller(user_id=None, client_id=principal.get("client_id"),
-                        encryption=e2e.ENCRYPTION_NONE, request_id=request_id)
-        log.info("legacy %s request_id=%s %s=%s client_id=%s", frame.get("type"),
-                 request_id, "tool" if is_call else "uri", target, caller.client_id)
-        try:
-            declared = self._check_target(is_call, target)
-            self._check_plaintext_allowed(target, caller.client_id)
-            payload = await self._run_handler(is_call, target, declared,
-                                              frame.get("arguments"), caller)
-            if is_call:
-                return {"type": "result", "request_id": request_id, "content": payload}
-            return {"type": "resource_result", "request_id": request_id, "contents": payload}
-        except ServiceError as exc:
-            message = str(exc)
-        except Exception as exc:
-            log.warning("request_id=%s: handler raised %s; answering an error",
-                        request_id, type(exc).__name__)
-            message = "internal error"
-        return {"type": "error", "request_id": request_id, "message": message}

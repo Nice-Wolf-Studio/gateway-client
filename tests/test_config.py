@@ -16,21 +16,38 @@ BASE = {"SERVICE_NAME": "svc", "SERVICE_CREDENTIAL": "cred",
 
 def test_from_env():
     key = KeyPair.generate()
-    cfg = Config.load(env={**BASE, "SERVICE_PRIVATE_KEY": key.private_b64(),
-                           "WN_BACKEND_TOKEN": "tok", "BACKEND_ID": "svc-1"})
+    cfg = Config.load(env={**BASE, "SERVICE_PRIVATE_KEY": key.private_b64()})
     assert (cfg.url, cfg.service_name, cfg.credential) == (
         "wss://gw.example/backend", "svc", "cred")
     assert cfg.key.public_raw == key.public_raw
-    assert (cfg.legacy_token, cfg.legacy_backend_id) == ("tok", "svc-1")
-    assert "cred" not in repr(cfg) and "tok" not in repr(cfg)
+    assert cfg.key_set_url == "https://gw.example/.well-known/jwks.json"
+    assert "cred" not in repr(cfg)
     assert key.private_b64() not in repr(cfg)
 
 
 def test_arguments_override_env_and_defaults():
     cfg = Config.load(service_name="other", env={**BASE, "SERVICE_PRIVATE_KEY":
                                                   KeyPair.generate().private_b64()})
-    assert cfg.service_name == "other" and cfg.legacy_token is None
-    assert cfg.legacy_backend_id == "other"
+    assert cfg.service_name == "other" and cfg.jwks_url is None
+
+
+def test_jwks_url_from_env_or_argument():
+    env = {**BASE, "SERVICE_PRIVATE_KEY": KeyPair.generate().private_b64(),
+           "GATEWAY_JWKS_URL": "https://keys.example/jwks.json"}
+    assert Config.load(env=env).key_set_url == "https://keys.example/jwks.json"
+    cfg = Config.load(env=env, jwks_url="https://other.example/jwks.json")
+    assert cfg.key_set_url == "https://other.example/jwks.json"
+    with pytest.raises(ConfigError, match="GATEWAY_JWKS_URL"):
+        Config.load(env={**env, "GATEWAY_JWKS_URL": "ftp://x/jwks.json"})
+
+
+def test_legacy_settings_are_gone():
+    env = {**BASE, "SERVICE_PRIVATE_KEY": KeyPair.generate().private_b64(),
+           "WN_BACKEND_TOKEN": "tok", "BACKEND_ID": "svc-1"}
+    cfg = Config.load(env=env)
+    assert not hasattr(cfg, "legacy_token") and not hasattr(cfg, "backend_id")
+    with pytest.raises(TypeError):
+        Config.load(env=env, legacy_token="tok")
 
 
 @pytest.mark.parametrize("missing", ["SERVICE_NAME", "SERVICE_CREDENTIAL"])
