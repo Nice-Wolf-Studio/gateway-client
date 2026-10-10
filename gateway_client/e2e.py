@@ -12,18 +12,32 @@ Envelope (exactly these seven fields):
 - `kid` names the SENDER's public key: a request carries the client's kid
   (the gateway checks it equals `client_kid`), a reply the service's kid (the
   gateway checks it equals the service's registered key id).
-- Associated data is the UTF-8 JSON, keys sorted, no spaces, of
-  `{contract_version, user_id, client_id, service, tool|uri, encryption,
-  nonce, sent_at}` for a request, plus `request_id` and
-  `"direction": "reply"` for a reply. `nonce` and `sent_at` are the
-  envelope's own.
+- Associated data (contract v2) is the UTF-8 JSON, keys sorted, no spaces,
+  of `{contract_version: 2, user_id, client_id, service, tool|uri,
+  encryption: "end-to-end", nonce, sent_at}` for a request, plus
+  `request_id` and `"direction": "reply"` for a reply, where
+
+      user_id    = the caller token's `sub` (the principal WRN)
+      client_id  = the caller token's `act` (the connected app WRN)
+      service    = the caller token's `aud` (the service's name)
+
+  taken from the VERIFIED GW-3 caller token, never from frame fields (a v2
+  frame carries no caller ids), and `nonce` and `sent_at` are the
+  envelope's own. The key names are those of contract v1 (spec section
+  7.1), so an encryptor changes only the version and the values. Example
+  request associated data:
+
+      {"client_id":"wrn:gateway:client/...","contract_version":2,
+       "encryption":"end-to-end","nonce":"...","sent_at":1800000000,
+       "service":"svc","tool":"echo","user_id":"wrn:wolf-access:user/..."}
 - The plaintext is the UTF-8 JSON of the value: the arguments object for a
   request; for a reply, the `payload` the service would send in `none` mode
   (content blocks, resource contents, or the error message string).
 - HPKE `info` is empty.
 - The receiver refuses a `sent_at` more than 5 minutes from its clock (either
-  direction) and a `nonce` already accepted for that client in the last 10
-  minutes. A nonce is recorded only after the envelope authenticates.
+  direction) and a `nonce` already accepted for that connected app (`act`)
+  in the last 10 minutes. A nonce is recorded only after the envelope
+  authenticates.
 
 This module never logs anything.
 """
@@ -62,7 +76,7 @@ ALG = "X25519-HKDF-SHA256-ChaCha20Poly1305"
 MODE = "auth"
 FIELDS = frozenset({"alg", "mode", "kid", "enc", "ct", "nonce", "sent_at"})
 MIME_TYPE = "application/vnd.gateway.e2e+json"
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 HPKE_INFO = b""
 KEY_BYTES = 32
 NONCE_BYTES = 16
@@ -178,7 +192,9 @@ def header(*, user_id: str, client_id: str, service: str, tool: str | None = Non
            uri: str | None = None, encryption: str = ENCRYPTION_E2E,
            contract_version: int = CONTRACT_VERSION) -> dict[str, Any]:
     """The request's associated-data fields, without `nonce` and `sent_at`
-    (those come from the envelope). Exactly one of `tool` / `uri`."""
+    (those come from the envelope). Exactly one of `tool` / `uri`. Under
+    contract v2 `user_id` is the caller token's `sub`, `client_id` its
+    `act` and `service` its `aud` (module docstring)."""
     if (tool is None) == (uri is None):
         raise ValueError("exactly one of tool / uri")
     fields: dict[str, Any] = {

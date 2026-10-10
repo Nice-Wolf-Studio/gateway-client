@@ -7,8 +7,7 @@
 | `SERVICE_CREDENTIAL` | The service's own credential. Required. |
 | `SERVICE_PRIVATE_KEY` | base64url raw X25519 private key. |
 | `SERVICE_PRIVATE_KEY_FILE` | A file holding it (read if present, created 0600 if not). |
-| `WN_BACKEND_TOKEN` | Legacy shared token; enables the old-protocol fallback. |
-| `BACKEND_ID` | Legacy registry id (default: `SERVICE_NAME`). |
+| `GATEWAY_JWKS_URL` | The gateway's key set for GW-3 caller tokens (default: derived from `GATEWAY_BACKEND_URL`, `wss://host/backend` -> `https://host/.well-known/jwks.json`). |
 
 When neither key variable is set, a key pair is generated and the private
 key printed ONCE to stderr with instructions; the gateway pins the public key
@@ -23,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, TextIO
 
+from .caller_token import jwks_url_for
 from .e2e import KeyPair
 from .errors import ConfigError
 
@@ -35,18 +35,18 @@ class Config:
     service_name: str
     credential: str = field(repr=False)
     key: KeyPair
-    legacy_token: str | None = field(default=None, repr=False)
-    backend_id: str | None = None
+    jwks_url: str | None = None
 
     @property
-    def legacy_backend_id(self) -> str:
-        return self.backend_id or self.service_name
+    def key_set_url(self) -> str:
+        """`jwks_url`, else the key-set URL derived from `url`."""
+        return self.jwks_url or jwks_url_for(self.url)
 
     @classmethod
     def load(cls, *, url: str | None = None, service_name: str | None = None,
              credential: str | None = None, private_key: str | KeyPair | None = None,
              private_key_file: str | os.PathLike | None = None,
-             legacy_token: str | None = None, backend_id: str | None = None,
+             jwks_url: str | None = None,
              env: Mapping[str, str] | None = None,
              stderr: TextIO | None = None) -> "Config":
         """Arguments win over the environment. Raises ConfigError."""
@@ -56,15 +56,16 @@ class Config:
         credential = (credential or env.get("SERVICE_CREDENTIAL") or "").strip()
         if not service_name or not credential:
             raise ConfigError("SERVICE_NAME and SERVICE_CREDENTIAL are required "
-                              "(gateway service contract version 1).")
+                              "(gateway service contract version 2).")
         if not url.startswith(("ws://", "wss://")):
             raise ConfigError("GATEWAY_BACKEND_URL must be a ws:// or wss:// URL")
         key = _load_key(private_key, private_key_file, env, service_name,
                         stderr or sys.stderr)
-        legacy_token = legacy_token or env.get("WN_BACKEND_TOKEN") or None
-        backend_id = backend_id or env.get("BACKEND_ID") or None
+        jwks_url = (jwks_url or env.get("GATEWAY_JWKS_URL") or "").strip() or None
+        if jwks_url is not None and not jwks_url.startswith(("https://", "http://")):
+            raise ConfigError("GATEWAY_JWKS_URL must be an https:// or http:// URL")
         return cls(url=url, service_name=service_name, credential=credential, key=key,
-                   legacy_token=legacy_token, backend_id=backend_id)
+                   jwks_url=jwks_url)
 
 
 def _load_key(private_key: str | KeyPair | None, key_file: str | os.PathLike | None,

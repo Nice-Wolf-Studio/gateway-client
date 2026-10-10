@@ -1,19 +1,19 @@
-"""The connection: register, ping, calls, errors, end-to-end, fallback,
-backoff and announcements, against an in-process fake gateway."""
+"""The connection: register, ping, calls, errors, caller-token checks,
+end-to-end, backoff and announcements, against an in-process fake gateway."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import time
-from pathlib import Path
 
 import pytest
 from helpers import (
+    APP,
+    PRINCIPAL,
     RESOURCES,
-    ROLES,
     TOOLS,
+    Issuer,
     fake_gateway,
     make_service,
     recv_json,
@@ -25,24 +25,30 @@ from helpers import (
 from gateway_client import Caller, KeyPair, ServiceError, e2e
 from gateway_client.protocol import Backoff
 
+ISSUER = Issuer()   # the gateway's signing key in these tests
 
-def _call(tool="echo", payload=None, *, request_id="r-1", encryption="none", **extra):
-    frame = {"type": "call", "request_id": request_id, "contract_version": 1,
-             "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
-             "tool": tool, "encryption": encryption, "payload": payload}
+
+def _call(tool="echo", payload=None, *, request_id="r-1", encryption="none",
+          token=None, **extra):
+    frame = {"type": "call", "request_id": request_id, "contract_version": 2,
+             "caller_token": token if token is not None else ISSUER.token(),
+             "service": "svc", "tool": tool, "encryption": encryption, "payload": payload}
     frame.update(extra)
     return frame
 
 
-def _read(uri="svc://status", *, request_id="r-2"):
-    return {"type": "read_resource", "request_id": request_id, "contract_version": 1,
-            "caller": {"user_id": "user-1", "client_id": "client-1"}, "service": "svc",
-            "uri": uri, "encryption": "none"}
+def _read(uri="svc://status", *, request_id="r-2", token=None, **extra):
+    frame = {"type": "read_resource", "request_id": request_id, "contract_version": 2,
+             "caller_token": token if token is not None else ISSUER.token(),
+             "service": "svc", "uri": uri, "encryption": "none"}
+    frame.update(extra)
+    return frame
 
 
 async def _one_exchange(frames, *, service_kwargs=None, after_register=None):
     """Register, send each frame in `frames`, return (register frame,
-    replies)."""
+    replies). The service checks tokens against ISSUER's key set unless
+    `service_kwargs` says otherwise."""
     loop = asyncio.get_running_loop()
     done = loop.create_future()
 
@@ -59,35 +65,46 @@ async def _one_exchange(frames, *, service_kwargs=None, after_register=None):
             done.set_result((register, replies))
         await ws.wait_closed()
 
+    kwargs = {"issuer": ISSUER, **(service_kwargs or {})}
     async with fake_gateway(handler) as url:
-        service = make_service(url, **(service_kwargs or {}))
+        service = make_service(url, **kwargs)
         return await serve_until(service, done)
 
 
 # --- register -------------------------------------------------------------------
 
-def test_v1_register_frame_contents():
+def test_v2_register_frame_contents():
     register, _ = run(_one_exchange([]))
     assert register == {
-        "type": "register", "contract_version": 1, "service": "svc",
+        "type": "register", "contract_version": 2, "service": "svc",
         "credential": "CRED-s3cr3t-value", "public_key": register["public_key"],
-        "accepts_caller": True, "tools": TOOLS, "resources": RESOURCES, "roles": ROLES,
-        "roles_version": 1,
+        "accepts_caller": True, "tools": TOOLS, "resources": RESOURCES,
     }
+    assert "roles" not in register and "roles_version" not in register
     assert len(e2e.decode_public_key(register["public_key"])) == 32
 
 
 def test_declaration_validated_locally():
     from gateway_client.protocol import Declaration
-    with pytest.raises(ValueError, match="undeclared"):
-        Declaration.build(TOOLS, RESOURCES, [dict(ROLES[0], tools=["nope"])], 1)
-    with pytest.raises(ValueError, match="requires_end_to_end"):
-        Declaration.build(TOOLS, RESOURCES, [{k: v for k, v in ROLES[0].items()
-                                              if k != "requires_end_to_end"}], 1)
     with pytest.raises(ValueError, match="inputSchema"):
         Declaration.build([{"name": "x", "description": ""}])
-    with pytest.raises(ValueError, match="roles_version"):
-        Declaration.build(TOOLS, RESOURCES, ROLES, 0)
+    with pytest.raises(ValueError, match="declared twice"):
+        Declaration.build(TOOLS + TOOLS[:1])
+    with pytest.raises(ValueError, match="mimeType"):
+        Declaration.build(TOOLS, [{"uri": "a://b", "name": "b", "description": ""}])
+
+
+def test_roles_are_not_part_of_the_api():
+    with pytest.raises(TypeError):
+        make_service("ws://127.0.0.1:1/backend", roles=[])
+    service = make_service("ws://127.0.0.1:1/backend")
+    with pytest.raises(TypeError):
+        run(service.update(roles=[]))
+
+
+def test_jwks_url_derived_from_the_backend_url():
+    service = make_service("wss://gw.example/backend")
+    assert service.jwks_url == "https://gw.example/.well-known/jwks.json"
 
 
 # --- rejected + backoff ----------------------------------------------------------
@@ -188,13 +205,18 @@ def test_call_dispatch_with_caller():
         seen.update(tool=tool, arguments=arguments, caller=caller)
         return [{"type": "text", "text": "ok"}]
 
-    _, replies = run(_one_exchange([_call(payload={"text": "hi"})],
+    token = ISSUER.token()
+    _, replies = run(_one_exchange([_call(payload={"text": "hi"}, token=token)],
                                    service_kwargs={"on_call": on_call}))
     assert replies == [{"type": "result", "request_id": "r-1", "encryption": "none",
                         "payload": [{"type": "text", "text": "ok"}]}]
-    assert seen == {"tool": "echo", "arguments": {"text": "hi"},
-                    "caller": Caller(user_id="user-1", client_id="client-1",
-                                     encryption="none", request_id="r-1")}
+    assert seen["tool"] == "echo" and seen["arguments"] == {"text": "hi"}
+    caller = seen["caller"]
+    assert caller == Caller(principal=PRINCIPAL, app=APP, encryption="none",
+                            request_id="r-1", token=token)
+    assert caller.claims["aud"] == "svc" and caller.claims["sub"] == PRINCIPAL
+    assert not hasattr(caller, "user_id") and not hasattr(caller, "client_id")
+    assert token not in repr(caller)
 
 
 def test_sync_handler_runs_and_string_result_becomes_text_block():
@@ -209,7 +231,7 @@ def test_sync_handler_runs_and_string_result_becomes_text_block():
 
 def test_read_resource_dispatch():
     async def on_read(uri, caller):
-        assert caller.client_id == "client-1"
+        assert (caller.principal, caller.app) == (PRINCIPAL, APP)
         return "all good"
 
     _, replies = run(_one_exchange([_read()], service_kwargs={"on_read": on_read}))
@@ -251,260 +273,201 @@ def test_unknown_tool_is_not_found():
     assert replies[0]["type"] == "error" and replies[0]["code"] == "not_found"
 
 
-def test_none_call_to_requires_end_to_end_role_refused():
-    called = []
-
-    async def on_call(tool, arguments, caller):
-        called.append(tool)
-        return "should not run"
-
-    _, replies = run(_one_exchange([_call(tool="secret_op", payload={})],
-                                   service_kwargs={"on_call": on_call}))
-    assert replies[0]["code"] == "not_allowed" and called == []
-
-
-def test_logs_never_contain_arguments_results_or_credentials(caplog):
+def test_logs_never_contain_arguments_results_credentials_or_tokens(caplog):
     async def on_call(tool, arguments, caller):
         return "RESULT-SECRET-777"
 
+    token = ISSUER.token()
     with caplog.at_level(logging.DEBUG):
         register, replies = run(_one_exchange(
-            [_call(payload={"text": "ARG-SECRET-555"})], service_kwargs={"on_call": on_call}))
+            [_call(payload={"text": "ARG-SECRET-555"}, token=token)],
+            service_kwargs={"on_call": on_call}))
     assert replies[0]["payload"][0]["text"] == "RESULT-SECRET-777"
     # Everything the service side logged (the fake gateway's own server log
     # is the test's, not the library's), at DEBUG, including the transport.
     ours = "\n".join(r.getMessage() for r in caplog.records
                      if not r.name.startswith("websockets.server"))
-    for secret in ("ARG-SECRET-555", "RESULT-SECRET-777", "CRED-s3cr3t-value"):
+    for secret in ("ARG-SECRET-555", "RESULT-SECRET-777", "CRED-s3cr3t-value", token,
+                   token.split(".")[2]):
         assert secret not in ours
     assert "r-1" in ours  # the request id is logged
+    assert PRINCIPAL in ours and APP in ours  # and the verified caller
 
 
-# --- caller ids (issue #2) ---------------------------------------------------------------
-#
-# Spec 6.2: `caller.user_id` and `caller.client_id` are always present, as
-# strings. A v1 frame unless both are non-empty, non-blank strings never
-# reaches the handler: it is answered `not_allowed`.
+# --- caller tokens (INT-C3): one test per failure mode, before any handler -------------
 
-# One value per class of bad id; "missing" deletes the key instead.
-BAD_IDS = {"missing": None, "null": None, "empty": "", "blank": " \t ",
-           "zero": 0, "number": 123, "false": False, "true": True,
-           "empty object": {}, "object": {"id": "client-1"},
-           "empty list": [], "list": ["client-1"]}
-
-
-def _strip_caller(frame, variant):
-    """`frame` with its caller ids missing or bad, per `variant`:
-    "no caller", "caller null", "caller not an object", or
-    "<user_id|client_id> <BAD_IDS key>"."""
-    frame = {**frame, "caller": dict(frame["caller"])}
-    if variant == "no caller":
-        del frame["caller"]
-    elif variant == "caller null":
-        frame["caller"] = None
-    elif variant == "caller not an object":
-        frame["caller"] = "user-1"
-    else:
-        field, how = variant.split(" ", 1)
-        if how == "missing":
-            del frame["caller"][field]
-        else:
-            frame["caller"][field] = BAD_IDS[how]
-    return frame
-
-
-NO_CALLER_IDS = ["no caller", "caller null", "caller not an object"] + [
-    f"{field} {how}" for field in ("user_id", "client_id") for how in BAD_IDS]
-
-
-REFUSAL = "caller user_id and client_id must be non-empty strings"
-
-
-def _assert_refused_not_allowed(reply, request_id, encryption="none"):
-    assert reply["type"] == "error"
-    assert reply["request_id"] == request_id
-    assert reply["encryption"] == encryption
-    assert reply["code"] == "not_allowed"
-
-
-@pytest.mark.parametrize("variant", NO_CALLER_IDS)
-def test_v1_call_without_caller_ids_refused_before_on_call(variant):
-    called = []
-
+def _refusing_handlers(called):
     async def on_call(tool, arguments, caller):
         called.append(caller)
         return "should not run"
 
-    frame = _strip_caller(_call(payload={"text": "x"}), variant)
-    _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call}))
-    _assert_refused_not_allowed(replies[0], "r-1")
-    assert replies[0]["payload"] == REFUSAL
-    assert called == []
-
-
-@pytest.mark.parametrize("variant", NO_CALLER_IDS)
-def test_v1_read_without_caller_ids_refused_before_on_read(variant):
-    called = []
-
     async def on_read(uri, caller):
         called.append(caller)
         return "should not run"
-
-    frame = _strip_caller(_read(), variant)
-    _, replies = run(_one_exchange([frame], service_kwargs={"on_read": on_read}))
-    _assert_refused_not_allowed(replies[0], "r-2")
-    assert replies[0]["payload"] == REFUSAL
-    assert called == []
+    return {"on_call": on_call, "on_read": on_read}
 
 
-def _e2e_read(client, *, request_id="r-e2e-read"):
-    return {**_read(request_id=request_id), "encryption": "end-to-end",
-            "client_public_key": client.public_b64, "client_kid": client.kid}
+FORGER = Issuer()
+
+BAD_TOKENS = {
+    "bad signature": lambda: FORGER.token(kid=ISSUER.kid),
+    "wrong aud": lambda: ISSUER.token(aud="other-service"),
+    "expired": lambda: ISSUER.token(now=time.time() - 300),
+    "lifetime over 60 s": lambda: ISSUER.token(ttl=3600),
+    "missing sub": lambda: ISSUER.token(drop=("sub",)),
+    "missing act": lambda: ISSUER.token(drop=("act",)),
+    "missing aud": lambda: ISSUER.token(drop=("aud",)),
+    "missing exp": lambda: ISSUER.token(drop=("exp",)),
+    "missing jti": lambda: ISSUER.token(drop=("jti",)),
+    "blank sub": lambda: ISSUER.token(sub=" "),
+    "no kid": lambda: ISSUER.token(kid=None),
+    "unknown kid": lambda: FORGER.token(),
+    "HS256": lambda: ISSUER.hs256_token(),
+    "not a JWT": lambda: "not-a-jwt",
+    "empty": lambda: "",
+}
 
 
 @pytest.mark.parametrize("kind", ["call", "read_resource"])
-@pytest.mark.parametrize("variant", ["no caller", "user_id empty", "client_id list"])
-def test_v1_end_to_end_refusal_is_an_envelope_the_gateway_relays(variant, kind):
-    # The gateway relays an end-to-end error only when its payload is an
-    # envelope under the service's key; anything else becomes `internal`
-    # (mcp-gateway gateway/envelope.py `service_error`). Like every other
-    # end-to-end error it is sealed to the ids as received, so a client
-    # whose ids were dropped cannot open the text, but it gets the code.
-    client, service_key = KeyPair.generate(), KeyPair.generate()
+@pytest.mark.parametrize("bad", list(BAD_TOKENS))
+def test_bad_caller_token_refused_before_the_handler(bad, kind):
     called = []
-
-    async def on_call(tool, arguments, caller):
-        called.append(caller)
-
-    async def on_read(uri, caller):
-        called.append(caller)
-
-    if kind == "call":
-        frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
-    else:
-        frame = _e2e_read(client)
-    frame = _strip_caller(frame, variant)
-    _, replies = run(_one_exchange([frame], service_kwargs={
-        "on_call": on_call, "on_read": on_read, "key": service_key}))
-    _assert_refused_not_allowed(replies[0], frame["request_id"], encryption="end-to-end")
-    e2e.check_shape(replies[0]["payload"])
-    assert replies[0]["payload"]["kid"] == service_key.kid  # what the gateway checks
-    sent = frame.get("caller") if isinstance(frame.get("caller"), dict) else {}
-    target = {"tool": "echo"} if kind == "call" else {"uri": "svc://status"}
-    fields = e2e.header(user_id=sent.get("user_id"), client_id=sent.get("client_id"),
-                        service="svc", **target)
-    assert _open_reply(replies[0], client, service_key, fields) == REFUSAL
+    token = BAD_TOKENS[bad]()
+    frame = _call(payload={"text": "x"}, token=token) if kind == "call" else \
+        _read(token=token)
+    _, replies = run(_one_exchange([frame], service_kwargs=_refusing_handlers(called)))
+    assert replies == [{"type": "error", "request_id": frame["request_id"],
+                        "encryption": "none", "code": "not_allowed",
+                        "payload": "caller token refused"}]
     assert called == []
 
 
-def test_v1_end_to_end_refusal_still_pins_its_client_id():
-    # An end-to-end frame with a client_id but no user_id is refused, yet it
-    # still pins that client: a plaintext call from it afterwards is refused.
-    client, service_key = KeyPair.generate(), KeyPair.generate()
+@pytest.mark.parametrize("variant", ["missing", "null", "number"])
+def test_frame_without_a_caller_token_refused(variant):
     called = []
+    frame = _call(payload={"text": "x"})
+    if variant == "missing":
+        del frame["caller_token"]
+    else:
+        frame["caller_token"] = None if variant == "null" else 42
+    _, replies = run(_one_exchange([frame], service_kwargs=_refusing_handlers(called)))
+    assert replies[0]["code"] == "not_allowed" and called == []
+
+
+def test_replayed_jti_refused_before_the_handler():
+    seen = []
 
     async def on_call(tool, arguments, caller):
-        called.append(caller)
-        return "should not run"
+        seen.append(caller.request_id)
+        return "ok"
 
-    frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
-    frames = [_strip_caller(frame, "user_id empty"), _call(payload={"text": "x"})]
-    _, replies = run(_one_exchange(frames, service_kwargs={"on_call": on_call,
-                                                           "key": service_key}))
-    assert [r["code"] for r in replies] == ["not_allowed", "not_allowed"]
-    assert called == []
+    token = ISSUER.token()
+    frames = [_call(payload={"text": "x"}, token=token, request_id="r-a"),
+              _call(payload={"text": "x"}, token=token, request_id="r-b")]
+    _, replies = run(_one_exchange(frames, service_kwargs={"on_call": on_call}))
+    assert replies[0]["type"] == "result"
+    assert replies[1]["code"] == "not_allowed" and seen == ["r-a"]
 
 
-@pytest.mark.parametrize("encryption", ["none", "end-to-end"])
-@pytest.mark.parametrize("variant", ["client_id list", "client_id object"])
-def test_v1_unhashable_client_id_never_reaches_the_downgrade_pin(variant, encryption,
-                                                                caplog):
-    # Before the fix a list or dict client_id reached the pin set (`add` or
-    # `in`), raised TypeError and was answered `internal` as a handler failure.
-    client, service_key = KeyPair.generate(), KeyPair.generate()
-    if encryption == "none":
-        frame = _call(payload={"text": "x"})
-    else:
-        frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
+def test_unknown_kid_refetches_the_key_set_then_serves():
+    # The gateway rotated its key: the first token under the new kid makes
+    # the library refetch the key set once, then it verifies.
+    old, new = Issuer(), Issuer()
+    published = [old]
+    fetches = []
+
+    def fetch(url):
+        fetches.append(url)
+        return {"keys": [k for i in published for k in i.jwks()["keys"]]}
+
+    async def rotate(ws):
+        published[:] = [new]
+
+    frames = [_call(payload={"text": "a"}, token=old.token(), request_id="r-old"),
+              _call(payload={"text": "b"}, token=new.token(), request_id="r-new")]
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            replies = []
+            await send_json(ws, frames[0])
+            replies.append(await recv_json(ws))
+            await rotate(ws)
+            await send_json(ws, frames[1])
+            replies.append(await recv_json(ws))
+            done.set_result(replies)
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            service = make_service(url, jwks_fetch=fetch, jwks_min_refetch_interval=0)
+            return await serve_until(service, done)
+
+    replies = run(main())
+    assert [r["type"] for r in replies] == ["result", "result"]
+    assert len(fetches) == 2
+
+
+def test_key_set_unreachable_answers_unavailable():
+    called = []
+
+    def fetch(url):
+        raise OSError("connection refused")
+
+    _, replies = run(_one_exchange([_call(payload={"text": "x"})], service_kwargs={
+        "jwks_fetch": fetch, **_refusing_handlers(called)}))
+    assert replies[0]["code"] == "unavailable" and called == []
+
+
+def test_token_refusal_logged_once_at_warning_without_token(caplog):
+    token = ISSUER.token(aud="other-service")
     with caplog.at_level(logging.DEBUG):
-        _, replies = run(_one_exchange([_strip_caller(frame, variant)],
-                                       service_kwargs={"key": service_key}))
-    assert replies[0]["code"] == "not_allowed"
-    assert "TypeError" not in caplog.text
+        run(_one_exchange([_call(payload={"text": "ARG-SECRET-555"}, token=token,
+                                 request_id="r-bad")]))
+    ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    about_it = [r for r in ours if "r-bad" in r.getMessage()]
+    warnings = [r for r in about_it if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "audience" in warnings[0].getMessage()
+    assert not any(token in r.getMessage() or "ARG-SECRET-555" in r.getMessage()
+                   for r in ours)
 
 
-def test_unknown_encryption_without_caller_ids_is_still_bad_arguments(caplog):
-    # The caller check runs after the encryption-mode check, as the target
-    # check did before it.
-    frame = _strip_caller(_call(payload={"text": "x"}, encryption="rot13"), "no caller")
-    with caplog.at_level(logging.INFO, logger="gateway_client"):
-        _, replies = run(_one_exchange([frame]))
+def test_identity_comes_only_from_the_token_not_frame_fields():
+    # A v1-style `caller` object (or any other field) cannot change who calls.
+    seen = []
+
+    async def on_call(tool, arguments, caller):
+        seen.append((caller.principal, caller.app))
+        return "ok"
+
+    frame = _call(payload={"text": "x"}, caller={"user_id": "mallory", "client_id": "evil"},
+                  principal={"client_id": "evil"}, user_id="mallory", sub="mallory")
+    _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call}))
+    assert replies[0]["type"] == "result" and seen == [(PRINCIPAL, APP)]
+
+
+def test_unknown_encryption_with_valid_token_is_bad_arguments():
+    _, replies = run(_one_exchange([_call(payload={"text": "x"}, encryption="rot13")]))
     assert replies[0]["code"] == "bad_arguments"
-    assert "call request_id=r-1 tool=echo" in caplog.text  # the request line
-
-
-@pytest.mark.parametrize("encryption", ["none", "end-to-end"])
-def test_refusal_without_caller_ids_logged_once_at_warning_without_payload(encryption,
-                                                                          caplog):
-    client, service_key = KeyPair.generate(), KeyPair.generate()
-    if encryption == "none":
-        frame = _call(payload={"text": "ARG-SECRET-555"}, request_id="r-no-caller")
-    else:
-        frame, _ = _e2e_call(client, service_key.public_raw, {"text": "ARG-SECRET-555"},
-                             request_id="r-no-caller")
-    frame = _strip_caller(frame, "no caller")
-    with caplog.at_level(logging.DEBUG):
-        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key}))
-    assert replies[0]["code"] == "not_allowed"
-    ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
-    about_it = [r for r in ours if "r-no-caller" in r.getMessage()]
-    # The request line every call gets, then the refusal, once, at WARNING.
-    assert [r.levelno for r in about_it] == [logging.INFO, logging.WARNING]
-    assert "refused" in about_it[1].getMessage()
-    assert not any("ARG-SECRET-555" in r.getMessage() for r in ours)
-
-
-def test_refusal_with_unusable_client_key_is_not_blamed_on_the_handler(caplog):
-    # A key that decodes but cannot be sealed to (all zero) fails while the
-    # refusal is sealed; that is not a handler failure.
-    zero = bytes(32)
-    frame = _strip_caller(_call(payload={"text": "x"}, encryption="end-to-end",
-                                client_public_key=e2e.b64url_encode(zero),
-                                client_kid=e2e.key_id(zero)), "no caller")
-    service = make_service("ws://127.0.0.1:9/backend")
-    reply = None
-    with caplog.at_level(logging.DEBUG):
-        try:
-            reply = run(service._reply_v1(frame))
-        except ValueError:
-            pass  # sealing to this key fails, as for any error reply on main
-    if reply is not None:
-        assert reply["code"] == "not_allowed"
-    ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
-    assert not any("handler raised" in r.getMessage() for r in ours)
-    assert [r.levelno for r in ours if r.levelno >= logging.WARNING] == [logging.WARNING]
-
-
-def test_caller_contract_says_fail_closed_on_legacy_none_user_id():
-    # Legacy calls reach the handler with `user_id=None` by design (see
-    # test_legacy_fallback_when_closed_1008_without_reply); the documented
-    # contract tells consumers to fail closed on it. (`python -OO` strips
-    # docstrings, so only the README is checked there.)
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
-    texts = [readme] if sys.flags.optimize >= 2 else [readme, Caller.__doc__]
-    for text in texts:
-        assert "fail closed" in " ".join(text.split())
 
 
 # --- end-to-end ------------------------------------------------------------------------
 
+def _fields(tool="echo", *, user_id=PRINCIPAL, client_id=APP, service="svc"):
+    """The v2 request associated data: the verified token's sub / act / aud."""
+    return e2e.header(user_id=user_id, client_id=client_id, service=service, tool=tool)
+
+
 def _e2e_call(client, service_pub, args, *, request_id="r-e2e", now=None, tool="echo",
-              kid=None, envelope=None):
-    fields = e2e.header(user_id="user-1", client_id="client-1", service="svc", tool=tool)
+              kid=None, envelope=None, fields=None, token=None):
+    fields = fields or _fields(tool)
     env = envelope or e2e.seal(args, sender=client, recipient_public_raw=service_pub,
                                fields=fields, now=now)
     frame = _call(tool=tool, payload=env, request_id=request_id, encryption="end-to-end",
-                  client_public_key=client.public_b64, client_kid=kid or client.kid)
+                  client_public_key=client.public_b64, client_kid=kid or client.kid,
+                  token=token)
     return frame, fields
 
 
@@ -516,22 +479,59 @@ def _open_reply(reply, client, service_key, fields):
                              fields=e2e.reply_header(fields, reply["request_id"]))
 
 
+def test_v2_associated_data_is_bound_to_the_verified_token():
+    aad = e2e.associated_data(_fields(), "Tk9OQ0U", 5)
+    assert aad == (b'{"client_id":"' + APP.encode() + b'","contract_version":2,'
+                   b'"encryption":"end-to-end","nonce":"Tk9OQ0U","sent_at":5,'
+                   b'"service":"svc","tool":"echo","user_id":"' + PRINCIPAL.encode() + b'"}')
+
+
 def test_e2e_round_trip_handler_sees_plain_arguments():
     client, service_key = KeyPair.generate(), KeyPair.generate()
     seen = {}
 
     async def on_call(tool, arguments, caller):
-        seen.update(arguments=arguments, encryption=caller.encryption)
+        seen.update(arguments=arguments, encryption=caller.encryption, app=caller.app)
         return [{"type": "text", "text": "sealed answer"}]
 
     frame, fields = _e2e_call(client, service_key.public_raw, {"text": "plain secret"})
     _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call,
                                                             "key": service_key}))
-    assert seen == {"arguments": {"text": "plain secret"}, "encryption": "end-to-end"}
+    assert seen == {"arguments": {"text": "plain secret"}, "encryption": "end-to-end",
+                    "app": APP}
     reply = replies[0]
     assert reply["type"] == "result" and "sealed answer" not in str(reply)
     assert _open_reply(reply, client, service_key, fields) == [
         {"type": "text", "text": "sealed answer"}]
+
+
+@pytest.mark.parametrize("wrong", [{"user_id": "wrn:wolf-access:user/u-other"},
+                                   {"client_id": "wrn:gateway:client/other"},
+                                   {"service": "other-svc"}])
+def test_e2e_envelope_bound_to_other_ids_than_the_token_refused(wrong):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+    frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"},
+                         fields=_fields(**wrong))
+    _, replies = run(_one_exchange([frame], service_kwargs={
+        "key": service_key, **_refusing_handlers(called)}))
+    assert replies[0]["code"] == "bad_arguments" and called == []
+    # The refusal is sealed to the token's ids, which the real client holds.
+    assert "decrypt" in _open_reply(replies[0], client, service_key, _fields())
+
+
+def test_e2e_token_refusal_is_plain_not_allowed():
+    # No verified identity, so no associated data to seal to: the gateway
+    # turns this plain reply into `internal` for the client.
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+    frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"},
+                         token=ISSUER.token(aud="other-service"))
+    _, replies = run(_one_exchange([frame], service_kwargs={
+        "key": service_key, **_refusing_handlers(called)}))
+    assert replies[0] == {"type": "error", "request_id": "r-e2e", "encryption": "end-to-end",
+                          "code": "not_allowed", "payload": "caller token refused"}
+    assert called == []
 
 
 def test_e2e_error_is_sealed_with_readable_code():
@@ -558,9 +558,8 @@ def test_e2e_wrong_kid_refused():
 def test_e2e_envelope_kid_other_than_client_refused():
     client, service_key = KeyPair.generate(), KeyPair.generate()
     other = KeyPair.generate()
-    fields = e2e.header(user_id="user-1", client_id="client-1", service="svc", tool="echo")
     env = e2e.seal({"text": "x"}, sender=other, recipient_public_raw=service_key.public_raw,
-                   fields=fields)
+                   fields=_fields())
     frame, fields = _e2e_call(client, service_key.public_raw, None, envelope=env)
     _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key}))
     assert replies[0]["code"] == "bad_arguments"
@@ -570,7 +569,7 @@ def test_e2e_envelope_kid_other_than_client_refused():
 def test_e2e_reused_nonce_refused():
     client, service_key = KeyPair.generate(), KeyPair.generate()
     frame, fields = _e2e_call(client, service_key.public_raw, {"text": "x"})
-    replay = dict(frame, request_id="r-replay")
+    replay = dict(frame, request_id="r-replay", caller_token=ISSUER.token())
     _, replies = run(_one_exchange([frame, replay], service_kwargs={"key": service_key}))
     assert replies[0]["type"] == "result"
     assert replies[1]["type"] == "error" and replies[1]["code"] == "not_allowed"
@@ -591,113 +590,17 @@ def test_e2e_arguments_checked_against_schema():
     assert replies[0]["code"] == "bad_arguments"
 
 
-def test_none_call_after_e2e_from_same_client_refused():
+def test_none_call_after_e2e_from_same_app_refused():
     client, service_key = KeyPair.generate(), KeyPair.generate()
     frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"})
     plain = _call(payload={"text": "x"}, request_id="r-plain")
-    _, replies = run(_one_exchange([frame, plain], service_kwargs={"key": service_key}))
+    other_app = _call(payload={"text": "x"}, request_id="r-other",
+                      token=ISSUER.token(act="wrn:gateway:client/another-app"))
+    _, replies = run(_one_exchange([frame, plain, other_app],
+                                   service_kwargs={"key": service_key}))
     assert replies[0]["type"] == "result"
     assert replies[1]["code"] == "not_allowed"
-
-
-# --- legacy fallback -----------------------------------------------------------------------
-
-def _legacy_gateway(log_frames, done, calls_to_serve=1):
-    """Behaves like the pre-contract gateway: closes 1008 on a register
-    without the right backend_token; else `registered` and serves calls."""
-    async def handler(ws):
-        frame = await recv_json(ws)
-        log_frames.append(frame)
-        if frame.get("backend_token") != "LEGACY-TOKEN":
-            await ws.close(1008)
-            return
-        await send_json(ws, {"type": "registered", "backend_id": frame["backend_id"]})
-        if len([f for f in log_frames if "backend_token" in f]) == 1:
-            await send_json(ws, {"type": "call", "request_id": "L-1", "tool": "echo",
-                                 "arguments": {"text": "old"},
-                                 "principal": {"client_id": "legacy-client"}})
-            reply = await recv_json(ws)
-            await send_json(ws, {"type": "read_resource", "request_id": "L-2",
-                                 "uri": "svc://nope"})
-            reply2 = await recv_json(ws)
-            await ws.close(1000)  # force a reconnect: v1 must be tried again
-            log_frames.append(("replies", reply, reply2))
-            return
-        if not done.done():
-            done.set_result(None)
-        await ws.wait_closed()
-    return handler
-
-
-def test_legacy_fallback_when_closed_1008_without_reply():
-    frames = []
-    seen = []
-
-    async def on_call(tool, arguments, caller):
-        seen.append(caller)
-        return f"legacy:{arguments['text']}"
-
-    async def main():
-        done = asyncio.get_running_loop().create_future()
-        async with fake_gateway(_legacy_gateway(frames, done)) as url:
-            service = make_service(url, legacy_token="LEGACY-TOKEN", on_call=on_call)
-            await serve_until(service, done)
-
-    run(main())
-    kinds = ["v1" if isinstance(f, dict) and "contract_version" in f else
-             "legacy" if isinstance(f, dict) else "replies" for f in frames]
-    assert kinds[:5] == ["v1", "legacy", "replies", "v1", "legacy"]
-    legacy_register = frames[1]
-    assert legacy_register == {"type": "register", "backend_token": "LEGACY-TOKEN",
-                               "backend_id": "svc", "tools": TOOLS, "resources": RESOURCES}
-    _, reply, reply2 = frames[2]
-    assert reply == {"type": "result", "request_id": "L-1",
-                     "content": [{"type": "text", "text": "legacy:old"}]}
-    assert reply2["type"] == "error" and reply2["request_id"] == "L-2"
-    assert seen == [Caller(user_id=None, client_id="legacy-client", encryption="none",
-                           request_id="L-1")]
-
-
-def test_no_fallback_without_legacy_token():
-    frames = []
-
-    async def main():
-        loop = asyncio.get_running_loop()
-        enough = loop.create_future()
-
-        async def handler(ws):
-            frames.append(await recv_json(ws))
-            if len(frames) >= 3 and not enough.done():
-                enough.set_result(None)
-            await ws.close(1008)
-
-        async with fake_gateway(handler) as url:
-            await serve_until(make_service(url, legacy_token=None), enough)
-
-    run(main())
-    assert len(frames) >= 3
-    assert all(f.get("contract_version") == 1 and "backend_token" not in f for f in frames)
-
-
-def test_rejected_never_falls_back_even_with_legacy_token():
-    frames = []
-
-    async def main():
-        loop = asyncio.get_running_loop()
-        enough = loop.create_future()
-
-        async def handler(ws):
-            frames.append(await recv_json(ws))
-            await send_json(ws, {"type": "rejected", "reason": "bad_role"})
-            if len(frames) >= 3 and not enough.done():
-                enough.set_result(None)
-            await ws.close(1008)
-
-        async with fake_gateway(handler) as url:
-            await serve_until(make_service(url, legacy_token="LEGACY-TOKEN"), enough)
-
-    run(main())
-    assert all("backend_token" not in f for f in frames)
+    assert replies[2]["type"] == "result"
 
 
 # --- re-register and announcements ------------------------------------------------------
@@ -735,19 +638,11 @@ def test_update_reregisters_then_announces_tools_changed():
             return result
 
     again, announce, direct = run(main())
-    assert again["type"] == "register" and again["contract_version"] == 1
-    assert [t["name"] for t in again["tools"]] == ["echo", "secret_op", "extra"]
-    assert again["roles_version"] == 1
+    assert again["type"] == "register" and again["contract_version"] == 2
+    assert [t["name"] for t in again["tools"]] == ["echo", "other", "extra"]
+    assert "roles" not in again and "roles_version" not in again
     assert announce == {"type": "tools_changed"}
     assert direct == {"type": "resources_changed"}
-
-
-def test_update_role_change_requires_higher_roles_version():
-    service = make_service("ws://127.0.0.1:1/backend")
-    changed = [dict(ROLES[0], tools=["echo", "secret_op"]), ROLES[1]]
-    with pytest.raises(ValueError, match="roles_version"):
-        run(service.update(roles=changed))
-    run(service.update(roles=changed, roles_version=2))  # not connected: stored
 
 
 def test_announce_when_not_registered_returns_false():
