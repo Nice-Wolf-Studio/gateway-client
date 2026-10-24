@@ -1,6 +1,7 @@
 """End to end over a real (loopback) WebSocket: the example service against a
-tiny server that behaves like the contract v1 gateway for `register` and one
-`call` (the gateway repo's `mock_backend` flow, from the gateway's side)."""
+tiny server that behaves like the contract v2 gateway for `register` and one
+`call` with a GW-3 caller token (the gateway repo's `mock_backend` flow, from
+the gateway's side). `test_gateway_e2e.py` runs the real gateway."""
 
 from __future__ import annotations
 
@@ -9,7 +10,8 @@ import pathlib
 import sys
 import uuid
 
-from helpers import fake_gateway, make_config, recv_json, run, send_json
+from helpers import (APP, PRINCIPAL, Issuer, fake_gateway, make_config, recv_json, run,
+                     send_json)
 
 from gateway_client import e2e
 
@@ -17,13 +19,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "examples")
 import selftest_service  # noqa: E402
 
 REQUIRED = ("service", "credential", "public_key", "accepts_caller", "tools",
-            "resources", "roles", "roles_version")
+            "resources")
 
 
 def _gateway_validate(frame: dict) -> str | None:
-    """The gateway's section 6.1 checks that need no database; the reason
-    it would reject with, or None."""
-    if frame.get("contract_version") != 1:
+    """mcp-gateway `development` `gateway/contract.py` `validate_register`
+    (the checks that need no database); the reason it would reject with, or
+    None."""
+    version = frame.get("contract_version")
+    if isinstance(version, bool) or version != 2:
         return "unsupported_contract"
     if any(f not in frame for f in REQUIRED) or frame["accepts_caller"] is not True:
         return "missing_field"
@@ -34,11 +38,6 @@ def _gateway_validate(frame: dict) -> str | None:
     for tool in frame["tools"]:
         if not {"name", "description", "inputSchema"} <= set(tool):
             return "malformed_tool"
-    names = {t["name"] for t in frame["tools"]}
-    for role in frame["roles"]:
-        if not set(role["tools"]) <= names or not isinstance(
-                role.get("requires_end_to_end"), bool):
-            return "bad_role"
     return None
 
 
@@ -47,6 +46,7 @@ def test_example_service_registers_and_answers_one_call():
         loop = asyncio.get_running_loop()
         done = loop.create_future()
         request_id = str(uuid.uuid4())
+        issuer = Issuer()
 
         async def gateway(ws):
             register = await recv_json(ws)
@@ -60,8 +60,8 @@ def test_example_service_registers_and_answers_one_call():
             await send_json(ws, {"type": "ping"})
             pong = await recv_json(ws)
             await send_json(ws, {
-                "type": "call", "request_id": request_id, "contract_version": 1,
-                "caller": {"user_id": "u-42", "client_id": "c-7"},
+                "type": "call", "request_id": request_id, "contract_version": 2,
+                "caller_token": issuer.token(aud=register["service"]),
                 "service": register["service"], "tool": "lib_selftest",
                 "encryption": "none", "payload": {"text": "hello"}})
             result = await recv_json(ws)
@@ -69,21 +69,22 @@ def test_example_service_registers_and_answers_one_call():
             await ws.wait_closed()
 
         async with fake_gateway(gateway) as url:
-            service = selftest_service.build(config=make_config(url))
+            service = selftest_service.build(config=make_config(url),
+                                             jwks_fetch=lambda u: issuer.jwks())
             runner = asyncio.create_task(service.run())
             try:
                 register, pong, result = await asyncio.wait_for(done, 10)
-                assert service.mode == "v1"
+                assert service.mode == "v2"
             finally:
                 await service.stop()
                 await runner
         return request_id, register, pong, result
 
     request_id, register, pong, result = run(main())
-    assert register["roles"][0]["name"] == "selftest-user"
+    assert "roles" not in register
     assert register["tools"][0]["name"] == "lib_selftest"
     assert pong == {"type": "pong"}
     assert result == {
         "type": "result", "request_id": request_id, "encryption": "none",
-        "payload": [{"type": "text", "text": "gateway-client selftest ok: user_id=u-42 "
-                     "client_id=c-7 encryption=none echo=hello"}]}
+        "payload": [{"type": "text", "text": f"gateway-client selftest ok: "
+                     f"principal={PRINCIPAL} app={APP} encryption=none echo=hello"}]}

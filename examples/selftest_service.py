@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Smallest real service: one tool, `lib_selftest`, and one role,
-`selftest-user`, covering it.
+"""Smallest real service: one tool, `lib_selftest`, that answers with the
+verified caller it was given.
 
     SERVICE_NAME=... SERVICE_CREDENTIAL=... SERVICE_PRIVATE_KEY_FILE=... \
         GATEWAY_BACKEND_URL=wss://<gateway>/backend python examples/selftest_service.py
@@ -24,24 +24,16 @@ TOOLS = [{
     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}},
                     "additionalProperties": False},
 }]
-ROLES = [{
-    "name": "selftest-user",
-    "description": "May call lib_selftest.",
-    "tools": ["lib_selftest"],
-    "resources": [],
-    "requires_end_to_end": False,
-}]
 
 
 async def on_call(tool: str, arguments: dict, caller: Caller) -> str:
-    return (f"gateway-client selftest ok: user_id={caller.user_id} "
-            f"client_id={caller.client_id} encryption={caller.encryption} "
+    return (f"gateway-client selftest ok: principal={caller.principal} "
+            f"app={caller.app} encryption={caller.encryption} "
             f"echo={arguments.get('text', '')}")
 
 
 def build(**config) -> GatewayService:
-    return GatewayService(tools=TOOLS, roles=ROLES, roles_version=1, on_call=on_call,
-                          **config)
+    return GatewayService(tools=TOOLS, on_call=on_call, **config)
 
 
 async def _once(service: GatewayService, timeout: float) -> int:

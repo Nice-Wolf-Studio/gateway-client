@@ -36,7 +36,7 @@ def test_round_trip_and_kid_names_sender():
 
 def test_associated_data_is_sorted_compact_utf8():
     aad = e2e.associated_data(_fields(), "Tk9OQ0U", 5)
-    assert aad == (b'{"client_id":"c1","contract_version":1,"encryption":"end-to-end",'
+    assert aad == (b'{"client_id":"c1","contract_version":2,"encryption":"end-to-end",'
                    b'"nonce":"Tk9OQ0U","sent_at":5,"service":"svc","tool":"echo",'
                    b'"user_id":"u1"}')
     reply = e2e.reply_header(_fields(), "r1")

@@ -1,11 +1,12 @@
 """Pure (no I/O) half of the client: what the service declares, the frames
 it sends, reply shaping and reconnect backoff.
 
-Contract version 1 is gateway spec section 6; the legacy protocol is the
-pre-contract `/backend` protocol (`register {backend_token, backend_id,
-tools, resources}`, `call {request_id, tool, arguments[, principal]}`,
-`read_resource {request_id, uri}`, replies `result {content}` /
-`resource_result {contents}` / `error {message}`).
+Service contract version 2 (mcp-gateway `development`, `gateway/contract.py`
+and `gateway/protocol.py`; docs/spec.md Interface): the `register` frame is
+`{type, contract_version: 2, service, credential, public_key,
+accepts_caller: true, tools, resources}`. Version 2 has no `roles` or
+`roles_version`; the gateway refuses a version 1 registration with
+`unsupported_contract`. There is no legacy (pre-contract) protocol.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 RETRY_CAP_SECONDS = 30.0      # backoff cap after a dropped connection
 REJECTED_CAP_SECONDS = 300.0  # backoff cap after `rejected`
@@ -28,19 +29,17 @@ def _nonempty_str(value: Any) -> bool:
 
 @dataclass(frozen=True)
 class Declaration:
-    """What a service declares: tools, resources, roles and `roles_version`.
-    Validated on construction with the gateway's own section 6.1 rules, so a
+    """What a service declares: its tools and resources. Validated on
+    construction with the gateway's own section 6.1 rules
+    (`gateway/contract.py` `_validate_tools` / `_validate_resources`), so a
     mistake fails at start instead of as a `rejected` loop."""
 
     tools: tuple[dict[str, Any], ...]
     resources: tuple[dict[str, Any], ...]
-    roles: tuple[dict[str, Any], ...]
-    roles_version: int
 
     @classmethod
-    def build(cls, tools: Iterable[dict], resources: Iterable[dict] = (),
-              roles: Iterable[dict] = (), roles_version: int = 1) -> "Declaration":
-        tools, resources, roles = list(tools), list(resources), list(roles)
+    def build(cls, tools: Iterable[dict], resources: Iterable[dict] = ()) -> "Declaration":
+        tools, resources = list(tools), list(resources)
         tool_names: set[str] = set()
         for i, tool in enumerate(tools):
             if not (isinstance(tool, dict) and _nonempty_str(tool.get("name"))
@@ -60,28 +59,7 @@ class Declaration:
             if res["uri"] in uris:
                 raise ValueError(f"resource {res['uri']!r} declared twice")
             uris.add(res["uri"])
-        role_names: set[str] = set()
-        for i, role in enumerate(roles):
-            if not (isinstance(role, dict) and _nonempty_str(role.get("name"))
-                    and isinstance(role.get("description"), str)
-                    and isinstance(role.get("tools"), list)
-                    and all(_nonempty_str(t) for t in role["tools"])
-                    and isinstance(role.get("resources"), list)
-                    and all(_nonempty_str(r) for r in role["resources"])
-                    and isinstance(role.get("requires_end_to_end"), bool)):
-                raise ValueError(f"roles[{i}] needs name, description, tools, resources "
-                                 "and requires_end_to_end (boolean)")
-            if role["name"] in role_names:
-                raise ValueError(f"role {role['name']!r} declared twice")
-            role_names.add(role["name"])
-            unknown = sorted(set(role["tools"]) - tool_names) + sorted(
-                set(role["resources"]) - uris)
-            if unknown:
-                raise ValueError(f"role {role['name']!r} names undeclared {unknown}")
-        if (not isinstance(roles_version, int) or isinstance(roles_version, bool)
-                or roles_version < 1):
-            raise ValueError("roles_version must be a positive integer")
-        return cls(tuple(tools), tuple(resources), tuple(roles), roles_version)
+        return cls(tuple(tools), tuple(resources))
 
     # --- lookups -----------------------------------------------------------------
 
@@ -95,34 +73,10 @@ class Declaration:
     def resource(self, uri: str) -> dict[str, Any] | None:
         return next((r for r in self.resources if r["uri"] == uri), None)
 
-    def e2e_only(self) -> frozenset[str]:
-        """Tool names and resource addresses in any role declared
-        `requires_end_to_end`: a `none` call to them is refused."""
-        out: set[str] = set()
-        for role in self.roles:
-            if role["requires_end_to_end"]:
-                out.update(role["tools"])
-                out.update(role["resources"])
-        return frozenset(out)
-
-    def role_set(self) -> frozenset:
-        """The role list in the gateway's comparison form (order-free)."""
-        return frozenset(
-            (r["name"], r["description"], frozenset(r["tools"]),
-             frozenset(r["resources"]), r["requires_end_to_end"]) for r in self.roles)
-
-    def check_successor(self, new: "Declaration") -> None:
-        """Raise ValueError when `new` would be refused `bad_role` for its
-        `roles_version` (lower, or equal with a different role list)."""
-        if new.roles_version < self.roles_version:
-            raise ValueError(f"roles_version {new.roles_version} is lower than "
-                             f"{self.roles_version}")
-        if new.roles_version == self.roles_version and new.role_set() != self.role_set():
-            raise ValueError("the role list changed: raise roles_version")
-
     # --- frames ------------------------------------------------------------------
 
-    def v1_register(self, service: str, credential: str, public_key: str) -> dict[str, Any]:
+    def register(self, service: str, credential: str, public_key: str) -> dict[str, Any]:
+        """The contract v2 `register` frame."""
         return {
             "type": "register",
             "contract_version": CONTRACT_VERSION,
@@ -132,13 +86,7 @@ class Declaration:
             "accepts_caller": True,
             "tools": list(self.tools),
             "resources": list(self.resources),
-            "roles": list(self.roles),
-            "roles_version": self.roles_version,
         }
-
-    def legacy_register(self, token: str, backend_id: str) -> dict[str, Any]:
-        return {"type": "register", "backend_token": token, "backend_id": backend_id,
-                "tools": list(self.tools), "resources": list(self.resources)}
 
 
 # --- reply shaping ----------------------------------------------------------------
