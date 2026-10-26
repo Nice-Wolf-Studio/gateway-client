@@ -74,6 +74,7 @@ This is a **breaking release**: a contract v2 gateway refuses v1 registrations (
 - **Local declaration validation refusals (`ValueError` in `Declaration.build`)**:
   - Validated at `GatewayService.__init__` (`197f3b8:gateway_client/service.py:177`) and `GatewayService.update` (`197f3b8:gateway_client/service.py:287-288`):
     - Tool missing non-empty `str` `name`, `str` `description`, or `dict` `inputSchema` raises `ValueError("tools[i] needs name, description and inputSchema")` (`197f3b8:gateway_client/protocol.py:44-48`).
+    - A tool may also carry an optional `annotations` object (MCP tool annotations: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`); `Declaration.build` keeps it and the `register` frame sends it unchanged. The gateway rejects a non-object `annotations` with `malformed_tool`.
     - Duplicate tool `name` raises `ValueError("tool <name> declared twice")` (`197f3b8:gateway_client/protocol.py:49-51`).
     - Resource missing non-empty `str` `uri`, `str` `name`, `str` `mimeType`, or `str` `description` raises `ValueError("resources[i] needs uri, name, mimeType and description")` (`197f3b8:gateway_client/protocol.py:53-58`).
     - Duplicate resource `uri` raises `ValueError("resource <uri> declared twice")` (`197f3b8:gateway_client/protocol.py:59-61`).
