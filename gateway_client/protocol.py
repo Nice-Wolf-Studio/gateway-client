@@ -27,6 +27,19 @@ def _nonempty_str(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+
+
+def _check_annotations(i: int, annotations: Any) -> None:
+    """A tool's optional MCP `annotations`, checked like the gateway does: an
+    object whose hints, when present, are booleans."""
+    if not isinstance(annotations, dict):
+        raise ValueError(f"tools[{i}] annotations must be an object")
+    for hint in ANNOTATION_HINTS:
+        if hint in annotations and not isinstance(annotations[hint], bool):
+            raise ValueError(f"tools[{i}] annotations.{hint} must be a boolean")
+
+
 @dataclass(frozen=True)
 class Declaration:
     """What a service declares: its tools and resources. Validated on
@@ -46,6 +59,8 @@ class Declaration:
                     and isinstance(tool.get("description"), str)
                     and isinstance(tool.get("inputSchema"), dict)):
                 raise ValueError(f"tools[{i}] needs name, description and inputSchema")
+            if "annotations" in tool:
+                _check_annotations(i, tool["annotations"])
             if tool["name"] in tool_names:
                 raise ValueError(f"tool {tool['name']!r} declared twice")
             tool_names.add(tool["name"])
