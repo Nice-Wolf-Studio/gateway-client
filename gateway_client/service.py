@@ -137,7 +137,9 @@ def _close_code(exc: ConnectionClosed) -> int | None:
 class GatewayService:
     """One service's connection to the gateway.
 
-    Required: `tools` (each `{name, description, inputSchema}`) and
+    Required: `tools` (each `{name, description, inputSchema}`, optionally
+    `annotations` — an MCP tool-annotations object whose hints are booleans,
+    passed through unchanged) and
     `on_call(tool, arguments, caller) -> content`. Optional: `resources`
     (each `{uri, name, mimeType, description}`), `on_read(uri, caller) ->
     contents`.
