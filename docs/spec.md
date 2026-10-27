@@ -72,6 +72,13 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
    (`protocol.py:40-62`, `service.py:177`). `roles=` / `roles_version=` no longer exist and raise
    `TypeError` [as-built] (`tests/test_service.py:97-102`). Passing both `config=` and
    configuration keyword arguments raises `TypeError` [as-built] (`service.py:173-175`).
+   Optional `instructions` (a string of at most 8192 characters; blank counts as none) and
+   `prompts` (each `{name, description, arguments?, messages}`; `name` starts with
+   `<SERVICE_NAME>_`; arguments `{name, description?, required?}` with names of letters, digits
+   and `_`; messages `{role: user|assistant, content: {type: text, text}}` whose `{{argument}}`
+   placeholders name declared arguments; no duplicate names) are checked with the gateway's
+   rules too [as-built] (`protocol.py` `_check_instructions`, `_check_prompt`, `Declaration.build`).
+   The gateway serves the prompts itself, filling the placeholders; there is no prompt handler.
 2. `service.run_forever()` or `await service.run()` [as-built] (`service.py:227-256`).
 3. Callbacks may be sync (run in a worker thread) or async [as-built] (`service.py:114-122`).
    A tool result may be content blocks, a string, or any JSON value [as-built] (`protocol.py:94-101`).
@@ -81,14 +88,14 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
 | Step | Rule | Anchor |
 |---|---|---|
 | Connect | Dial **out** to `GATEWAY_BACKEND_URL` (default `ws://127.0.0.1:8000/backend`); no inbound port on the service. Frame limit 5 MB; open/reply timeout 30 s. | `config.py:29`, `service.py:60-61`, `336-338` |
-| Register frame | `{type: register, contract_version: 2, service, credential, public_key, accepts_caller: true, tools, resources}`. The gateway refuses any other `contract_version` with `unsupported_contract` and requires exactly these fields. | `protocol.py:78-89`; `mcp-gateway:gateway/contract.py:63-66`, `245-257` |
+| Register frame | `{type: register, contract_version: 2, service, credential, public_key, accepts_caller: true, tools, resources}`, plus optional `instructions` and `prompts` (sent only when declared; additive, so a frame without them is the same as before). The gateway refuses any other `contract_version` with `unsupported_contract` and requires exactly these fields. | `protocol.py:78-89`; `mcp-gateway:gateway/contract.py:63-66`, `245-257` |
 | Credential | `SERVICE_CREDENTIAL`, issued on the gateway's Services page; required. The gateway compares its SHA-256 against stored hashes in constant time; a mismatch is `rejected: bad_credential`. Expired or retired credentials are refused (GW-6). | `config.py:55-59`; `mcp-gateway:gateway/contract.py:43`, `151-168`; `mcp-gateway:docs/spec.md:28`, `:65` |
 | Key | `SERVICE_PRIVATE_KEY` (base64url raw X25519), or `SERVICE_PRIVATE_KEY_FILE` (read, or created with mode 0600 via `O_EXCL`), or else a fresh key printed **once** to stderr. The gateway stores the service's public key; a different key is `rejected: key_changed` and kept as the pending key until an admin approves it. | `config.py:71-113`; `mcp-gateway:gateway/contract.py:48`; `mcp-gateway:docs/spec.md:27`, `:68` |
 | Reply | Waits for `registered` or `rejected {reason}`, answering any `ping` meanwhile. Gateway reasons: `bad_credential`, `unsupported_contract`, `missing_field`, `malformed_tool`, `name_reserved`, `key_changed`. | `service.py:365-390`; `mcp-gateway:gateway/contract.py:42-52` |
 | Rejected | Logged once per change of reason; retried with exponential backoff and jitter capped at 300 s. | `service.py:246-255`, `protocol.py:21-22`, `131-135` |
 | Legacy fallback | Removed in v0.2.0: there is no legacy (pre-contract) protocol, `WN_BACKEND_TOKEN` and `BACKEND_ID` are gone. A gateway that closes **without** answering the register (or no reply within 30 s) is retried with contract v2 and backoff capped at 30 s. | `protocol.py:9`, `service.py:343-348`, `251-255`; `CHANGELOG.md:53-56`; `tests/test_config.py:44-51` |
 | Dropped connection | Backoff capped at 30 s; reset after a successful registration. | `protocol.py:21`, `service.py:392-394` |
-| Changes | `update(tools=..., resources=...)` re-registers on the same connection; accepted → `tools_changed` if the tools changed, `resources_changed` if the resources changed (with `announce=True`); rejected → previous declaration restored, `RegistrationRejected` raised, and the 300 s cap applies after the disconnect. | `service.py:273-316`, `356-358` |
+| Changes | `update(tools=..., resources=..., prompts=..., instructions=...)` re-registers on the same connection; accepted → `tools_changed` if the tools changed, `resources_changed` if the resources changed, `prompts_changed` if the prompts changed (with `announce=True`; instructions have no announcement and reach apps at their next `initialize`); rejected → previous declaration restored, `RegistrationRejected` raised, and the 300 s cap applies after the disconnect. | `service.py:273-316`, `356-358` |
 
 ### 2.4 Call handshake (contract v2, auth)
 

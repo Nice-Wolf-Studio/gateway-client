@@ -21,7 +21,7 @@ from .errors import (
 from .protocol import CONTRACT_VERSION
 from .service import Caller, GatewayService
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "BAD_ARGUMENTS", "CONTRACT_VERSION", "ERROR_CODES", "INTERNAL", "NOT_ALLOWED",
