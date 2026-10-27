@@ -94,6 +94,35 @@ def test_declaration_validated_locally():
         Declaration.build(TOOLS, [{"uri": "a://b", "name": "b", "description": ""}])
 
 
+def _tool_with(annotations):
+    return {"name": "x", "description": "d", "inputSchema": {"type": "object"},
+            "annotations": annotations}
+
+
+@pytest.mark.parametrize("bad", ["readOnly", ["readOnlyHint"], True, 1, None])
+def test_non_object_annotations_are_refused_locally(bad):
+    from gateway_client.protocol import Declaration
+    with pytest.raises(ValueError, match="annotations must be an object"):
+        Declaration.build([_tool_with(bad)])
+
+
+@pytest.mark.parametrize("hint", ["readOnlyHint", "destructiveHint",
+                                  "idempotentHint", "openWorldHint"])
+@pytest.mark.parametrize("bad_value", ["true", "maybe", 1, 0, None, [], {}])
+def test_non_bool_annotation_hint_is_refused_locally(hint, bad_value):
+    from gateway_client.protocol import Declaration
+    with pytest.raises(ValueError, match=f"annotations.{hint} must be a boolean"):
+        Declaration.build([_tool_with({hint: bad_value})])
+
+
+def test_valid_annotations_are_kept_in_the_register_frame():
+    from gateway_client.protocol import Declaration
+    annotations = {"readOnlyHint": True, "destructiveHint": False,
+                   "idempotentHint": True, "openWorldHint": False, "title": "X"}
+    frame = Declaration.build([_tool_with(annotations)]).register("s", "c", "k")
+    assert frame["tools"][0]["annotations"] == annotations
+
+
 def test_roles_are_not_part_of_the_api():
     with pytest.raises(TypeError):
         make_service("ws://127.0.0.1:1/backend", roles=[])

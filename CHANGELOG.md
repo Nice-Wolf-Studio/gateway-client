@@ -3,6 +3,30 @@
 The version follows semantic versioning; before 1.0.0 a breaking change
 raises the minor version.
 
+## 0.3.0
+
+Additive to service contract version 2: nothing changes for a service
+that passes neither new argument, and a gateway that predates them ignores
+them.
+
+### Added
+
+- `GatewayService(instructions=...)`: optional server instructions, a
+  string of at most 8192 characters (`protocol.MAX_INSTRUCTIONS_CHARS`),
+  sent as `instructions` in `register`. The gateway returns the
+  instructions of the services an MCP app may use at `initialize`, each
+  under a header naming the service.
+- `GatewayService(prompts=[...])`: optional MCP prompts, sent as `prompts`
+  in `register` and served by the gateway itself (`prompts/list`,
+  `prompts/get`; `{{argument}}` placeholders filled by the gateway). Each
+  name starts with `<SERVICE_NAME>_`.
+- `update(prompts=..., instructions=...)`, and `prompts_changed` announced
+  after an accepted update that changed the prompts;
+  `send_prompts_changed()`.
+- Tools may carry MCP `annotations` (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`); a non-object value or a non-boolean
+  hint is refused locally, as the gateway refuses it (`malformed_tool`).
+
 ## 0.2.0
 
 Service contract version 2 (issue #15). **Breaking.** mcp-gateway
