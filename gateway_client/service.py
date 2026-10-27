@@ -61,6 +61,7 @@ DEFAULT_MAX_FRAME_BYTES = 5 * 1024 * 1024  # the gateway's own frame limit
 DEFAULT_REPLY_TIMEOUT = 30.0               # wait for `registered` / `rejected`
 TOKEN_REFUSED = "caller token refused"
 TOKEN_UNCHECKED = "caller token could not be checked; retry"
+_KEEP: Any = object()   # `update()`: leave this part of the declaration as it is
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,12 @@ class GatewayService:
     passed through unchanged) and
     `on_call(tool, arguments, caller) -> content`. Optional: `resources`
     (each `{uri, name, mimeType, description}`), `on_read(uri, caller) ->
-    contents`.
+    contents`, `instructions` (a string of at most 8192 characters the
+    gateway gives MCP apps at initialize, under a header naming this
+    service) and `prompts` (MCP prompts served by the gateway itself, so no
+    handler: each `{name, description, arguments?, messages}`, `name`
+    starting with `<SERVICE_NAME>_`, each message `{role, content: {type:
+    "text", text}}` whose `{{argument}}` placeholders the gateway fills in).
 
     Configuration comes from `config`, else from keyword arguments
     (`url`, `service_name`, `credential`, `private_key`, `private_key_file`,
@@ -162,6 +168,7 @@ class GatewayService:
 
     def __init__(self, *, tools: Iterable[dict], on_call: OnCall,
                  resources: Iterable[dict] = (), on_read: OnRead | None = None,
+                 prompts: Iterable[dict] = (), instructions: str | None = None,
                  config: Config | None = None,
                  max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
                  reply_timeout: float = DEFAULT_REPLY_TIMEOUT,
@@ -176,7 +183,9 @@ class GatewayService:
             raise TypeError("pass either config or configuration keyword arguments, "
                             f"not both (got {', '.join(sorted(config_kwargs))})")
         self.config = config if config is not None else Config.load(**config_kwargs)
-        self._decl = Declaration.build(tools, resources)
+        self._decl = Declaration.build(tools, resources, prompts=prompts,
+                                       instructions=instructions,
+                                       service=self.config.service_name)
         self._verifier = CallerTokenVerifier(
             self.config.service_name,
             KeySet(self.config.key_set_url, fetch=jwks_fetch,
@@ -274,11 +283,16 @@ class GatewayService:
 
     async def update(self, *, tools: Iterable[dict] | None = None,
                      resources: Iterable[dict] | None = None,
+                     prompts: Iterable[dict] | None = None,
+                     instructions: Any = _KEEP,
                      announce: bool = True) -> None:
         """Change what the service declares and re-register on the same
-        connection. When accepted and `announce` is true, send
-        `tools_changed` if the tools changed and `resources_changed` if the
-        resources changed.
+        connection. An argument left out keeps its current value
+        (`instructions=None` removes the instructions). When accepted and
+        `announce` is true, send `tools_changed` if the tools changed,
+        `resources_changed` if the resources changed and `prompts_changed`
+        if the prompts changed. Instructions have no announcement: MCP apps
+        get them at their next initialize.
 
         If the gateway rejects the new declaration the previous one is
         restored (used on the next reconnect) and RegistrationRejected is
@@ -286,10 +300,15 @@ class GatewayService:
         registration and nothing is announced."""
         async with self._update_lock:
             old = self._decl
-            new = Declaration.build(old.tools if tools is None else tools,
-                                    old.resources if resources is None else resources)
+            new = Declaration.build(
+                old.tools if tools is None else tools,
+                old.resources if resources is None else resources,
+                prompts=old.prompts if prompts is None else prompts,
+                instructions=old.instructions if instructions is _KEEP else instructions,
+                service=self.config.service_name)
             tools_changed = list(new.tools) != list(old.tools)
             resources_changed = list(new.resources) != list(old.resources)
+            prompts_changed = list(new.prompts) != list(old.prompts)
             self._decl = new
             ws = self._ws
             if ws is None:
@@ -310,12 +329,15 @@ class GatewayService:
                 self._decl = old
                 self._rejected_on_update = reason
                 raise RegistrationRejected(reason)
-            log.info("re-registered: %d tool(s), %d resource(s)", len(new.tools),
-                     len(new.resources))
+            log.info("re-registered: %d tool(s), %d resource(s), %d prompt(s), "
+                     "instructions %s", len(new.tools), len(new.resources),
+                     len(new.prompts), "set" if new.instructions else "none")
             if announce and tools_changed:
                 await self.send_tools_changed()
             if announce and resources_changed:
                 await self.send_resources_changed()
+            if announce and prompts_changed:
+                await self.send_prompts_changed()
 
     async def send_tools_changed(self) -> bool:
         """Announce `tools_changed`. False when not registered."""
@@ -324,6 +346,11 @@ class GatewayService:
     async def send_resources_changed(self) -> bool:
         """Announce `resources_changed`. False when not registered."""
         return await self._announce("resources_changed")
+
+    async def send_prompts_changed(self) -> bool:
+        """Announce `prompts_changed`. False when not registered. (A gateway
+        older than prompt support ignores it.)"""
+        return await self._announce("prompts_changed")
 
     # --- connection ------------------------------------------------------------------
 
@@ -399,8 +426,10 @@ class GatewayService:
         self._registered_event.set()
         d = self._decl
         log.info("registered as service %r (contract v2): %d tool(s), %d resource(s), "
-                 "kid %s; caller tokens checked against %s", self.config.service_name,
-                 len(d.tools), len(d.resources), self.kid, self.jwks_url)
+                 "%d prompt(s), instructions %s, kid %s; caller tokens checked against "
+                 "%s", self.config.service_name, len(d.tools), len(d.resources),
+                 len(d.prompts), "set" if d.instructions else "none", self.kid,
+                 self.jwks_url)
 
     def _on_disconnected(self) -> None:
         self._ws, self._mode = None, None

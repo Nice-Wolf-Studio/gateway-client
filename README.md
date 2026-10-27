@@ -45,6 +45,46 @@ service.run_forever()          # or: await service.run() inside your own loop
 The service code sees plain arguments and returns plain results in both
 encryption modes. Callbacks may be sync (run in a worker thread) or async.
 
+### Teaching the model: instructions and prompts
+
+Both are optional; a service that passes neither registers exactly as before.
+
+```python
+service = GatewayService(
+    tools=TOOLS, on_call=on_call,
+    instructions="Call tasks_triage before resolving more than one task.",
+    prompts=[{
+        "name": "tasks_triage",                 # must start with "<SERVICE_NAME>_"
+        "description": "Triage the open tasks of one project.",
+        "arguments": [{"name": "project", "description": "Project key.", "required": True},
+                      {"name": "limit", "description": "How many to show."}],
+        "messages": [{"role": "user", "content": {
+            "type": "text",
+            "text": "List up to {{limit}} open tasks in {{project}} and rank them."}}],
+    }])
+```
+
+- `instructions`: a string of at most 8192 characters. At `initialize` the
+  gateway returns, to each MCP app, the instructions of every service that
+  app may use, each under a `## <service>` header. A change
+  (`update(instructions=...)`) reaches an app at its next `initialize`; MCP
+  has no notice for it.
+- `prompts`: MCP prompts the **gateway** serves from this declaration (no
+  handler, no round trip). `prompts/list` shows them to the callers allowed
+  to use the service, like tools; `prompts/get` fills each `{{argument}}`
+  placeholder with the caller's value (a missing optional argument becomes
+  empty text; a missing required one is refused). Every name starts with
+  `<SERVICE_NAME>_` and is unique across services. Each message is
+  `{role: "user" | "assistant", content: {type: "text", text}}`; every
+  placeholder must name a declared argument (letters, digits, `_`).
+- `update(prompts=...)` re-registers and, when accepted, announces
+  `prompts_changed`, which the gateway relays as
+  `notifications/prompts/list_changed`. `send_prompts_changed()` announces on
+  its own.
+
+Both are validated locally with the gateway's rules (`ValueError` at start).
+A gateway that predates them ignores the two fields and the announcement.
+
 ### Who is calling
 
 `Caller` is built from the call's **verified** GW-3 caller token and from
@@ -84,13 +124,13 @@ and `jwks_fetch(url) -> dict` to replace the HTTP fetch (tests).
 
 | Contract part | Behaviour |
 |---|---|
-| Register | Sends `{type: register, contract_version: 2, service, credential, public_key, accepts_caller: true, tools, resources}`, exactly the fields `gateway/contract.py` requires (v2 has no `roles` / `roles_version`). The declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
+| Register | Sends `{type: register, contract_version: 2, service, credential, public_key, accepts_caller: true, tools, resources}`, exactly the fields `gateway/contract.py` requires (v2 has no `roles` / `roles_version`), plus `instructions` and `prompts` only when the service declares them. The declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
 | Ping | Every `ping` is answered `pong`. |
 | Caller token (GW-3, INT-C3) | Checked on every `call` and `read_resource` **before anything else**: compact JWS with header `alg: EdDSA` and a `kid`; the `kid` is in the gateway key set; the Ed25519 signature verifies; `sub`, `act`, `aud`, `exp`, `jti` present, with `sub`, `act`, `jti` non-blank strings; `aud` is a string equal to `SERVICE_NAME` (a list is refused); `exp` not passed (10 s skew) and no more than 60 s (+ skew) ahead; `jti` not already accepted while the token could be valid (in-memory). Any failure is answered `not_allowed` with the text `caller token refused` and logged once at WARNING with the failed check (never the token); the handler never runs. When the key set cannot be fetched at all the answer is `unavailable` (the token was not checked; a retry may succeed). |
 | Key set | `GET` of the JWKS on first use, cached; an unknown `kid` triggers one refetch (the gateway rotated its key), at most one fetch per 10 s however many tokens arrive, and concurrent checks share one fetch. Refreshed after 1 h; a failed refresh keeps the cached keys. Only Ed25519 (`kty OKP`, `crv Ed25519`) keys are used. |
 | Call / read | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. The request id and the verified `principal` / `app` are logged. Frame fields other than the token (a v1 `caller` object, say) never affect who is calling. |
 | Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged). |
-| Changes | `await service.update(tools=..., resources=...)` re-registers on the same connection and, when accepted, sends `tools_changed` / `resources_changed`. A rejected update restores the previous declaration and raises `RegistrationRejected`. `send_tools_changed()` / `send_resources_changed()` announce on their own. |
+| Changes | `await service.update(tools=..., resources=..., prompts=..., instructions=...)` re-registers on the same connection and, when accepted, sends `tools_changed` / `resources_changed` / `prompts_changed` for what changed (instructions have no announcement). A rejected update restores the previous declaration and raises `RegistrationRejected`. `send_tools_changed()` / `send_resources_changed()` / `send_prompts_changed()` announce on their own. |
 | End-to-end (7, 7.1) | Opens the client's envelope (HPKE Auth mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305, empty `info`), checks the arguments against the tool's `inputSchema`, and seals the result or error text to `client_public_key`. Refused: a `kid` that is not the client's (`bad_arguments`), a tampered or undecryptable envelope, including one bound to other ids than the token's (`bad_arguments`), a `sent_at` more than 5 minutes off (`not_allowed`), a nonce already used by that app in the last 10 minutes (`not_allowed`). A token refusal in `end-to-end` is sent in plaintext (there is no verified identity to bind it to), which the gateway relays to the client as `internal`. |
 | Downgrade (7) | A `none` call from a connected app (`act`) this process has seen in `end-to-end` is refused `not_allowed`. Which tools require end-to-end is decided by wolf-access (permissions carry `requires_end_to_end`) and enforced by the gateway before routing. |
 | Reconnect | Exponential backoff with jitter, capped at 5 minutes after `rejected` and 30 seconds after a dropped connection, reset after a successful registration. The rejection reason is logged once per change. There is no legacy-protocol fallback. |
