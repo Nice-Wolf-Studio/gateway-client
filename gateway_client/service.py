@@ -498,12 +498,26 @@ class GatewayService:
     # --- requests --------------------------------------------------------------------
 
     async def _answer(self, ws: ClientConnection, frame: dict[str, Any]) -> None:
-        reply = await self._reply(frame)
+        """Reply to one request. Never ends with an unhandled exception: a
+        failure building the reply is logged and answered with a plain
+        `internal` error, so the gateway is not left waiting."""
+        request_id = frame.get("request_id")
+        try:
+            reply = await self._reply(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("request_id=%s: could not build the reply (%s); answering plain "
+                      "error %s", request_id, type(exc).__name__, INTERNAL)
+            reply = {"type": "error", "request_id": request_id,
+                     "encryption": frame.get("encryption"), "code": INTERNAL,
+                     "payload": "internal error"}
         try:
             await self._send(ws, reply)
         except ConnectionClosed:
-            log.warning("request_id=%s: reply not sent, the connection closed",
-                        frame.get("request_id"))
+            log.warning("request_id=%s: reply not sent, the connection closed", request_id)
+        except Exception as exc:
+            log.error("request_id=%s: reply not sent (%s)", request_id, type(exc).__name__)
 
     def _check_target(self, is_call: bool, target: Any) -> dict[str, Any]:
         """The declared tool or resource, else ServiceError(not_found)."""
@@ -556,7 +570,9 @@ class GatewayService:
     @staticmethod
     def _client_key(frame: dict[str, Any]) -> bytes:
         """The client's raw public key from an `end-to-end` frame, checked
-        against `client_kid`."""
+        against `client_kid` and refused when a reply cannot be sealed to it
+        (a small-order point such as all zeros): the refusal is then plain,
+        not sealed, and the caller's app is not pinned."""
         try:
             raw = e2e.decode_public_key(frame.get("client_public_key"), "client_public_key")
         except ValueError:
@@ -565,6 +581,11 @@ class GatewayService:
         if frame.get("client_kid") != e2e.key_id(raw):
             raise ServiceError(BAD_ARGUMENTS, "client_kid does not match "
                                               "client_public_key")
+        try:
+            e2e.check_public_key(raw)
+        except ValueError:
+            raise ServiceError(BAD_ARGUMENTS, "client_public_key cannot be used for "
+                                              "end-to-end encryption") from None
         return raw
 
     async def _verify_caller(self, frame: dict[str, Any]) -> VerifiedToken:
@@ -627,14 +648,17 @@ class GatewayService:
                 self._check_plaintext_allowed(caller.app)
                 arguments = frame.get("payload")
             payload = await self._run_handler(is_call, target, declared, arguments, caller)
-            return self._reply_frame("result", request_id, encryption, payload,
-                                     client_key, fields)
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
         except Exception as exc:  # the service's own failure: never leak its text
             log.warning("request_id=%s: handler raised %s; answering internal",
                         request_id, type(exc).__name__)
             code, message = INTERNAL, "internal error"
+        else:
+            # Sealing happens outside the try: a seal failure is not the
+            # handler's, and _reply_frame answers it itself.
+            return self._reply_frame("result", request_id, encryption, payload,
+                                     client_key, fields)
         log.info("request_id=%s answered error %s", request_id, code)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
@@ -645,10 +669,19 @@ class GatewayService:
         """`{type, request_id, encryption, [code,] payload}`; in `end-to-end`
         the payload is sealed to the client when the client's key and the
         verified caller are known (else plain, which the gateway turns into
-        `internal`)."""
+        `internal`). Should sealing fail anyway, the reply is a plain
+        `error`: the same code and message for an error, `internal` for a
+        result (a result is never sent unsealed)."""
         if encryption == e2e.ENCRYPTION_E2E and client_key is not None and fields is not None:
-            payload = e2e.seal(payload, sender=self.config.key, recipient_public_raw=client_key,
-                               fields=e2e.reply_header(fields, str(request_id)))
+            try:
+                payload = e2e.seal(payload, sender=self.config.key,
+                                   recipient_public_raw=client_key,
+                                   fields=e2e.reply_header(fields, str(request_id)))
+            except Exception as exc:
+                if ftype != "error" or code is None:
+                    ftype, code, payload = "error", INTERNAL, "internal error"
+                log.warning("request_id=%s: could not seal the reply (%s); answering "
+                            "plain error %s", request_id, type(exc).__name__, code)
         reply: dict[str, Any] = {"type": ftype, "request_id": request_id,
                                  "encryption": encryption}
         if code is not None:
