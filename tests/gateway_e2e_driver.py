@@ -48,7 +48,8 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
 SERVICE = "gwc_e2e"
 TOOL = {"name": "whoami", "description": "gateway-client e2e: who is calling.",
-        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}},
+        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"},
+                                                         "fail": {"type": "boolean"}},
                         "additionalProperties": False}}
 
 checks: dict[str, tuple[bool, str]] = {}
@@ -164,6 +165,8 @@ async def main() -> int:
 
     async def on_call(tool, arguments, caller):
         seen.append(caller)
+        if arguments.get("fail"):
+            return {"isError": True, "content": [{"type": "text", "text": "tool domain error"}]}
         return {"principal": caller.principal, "app": caller.app,
                 "encryption": caller.encryption, "aud": caller.claims["aud"],
                 "text": arguments.get("text")}
@@ -215,6 +218,18 @@ async def main() -> int:
         check("none: Caller.token is a forwardable compact JWT",
               bool(seen) and seen[-1].token.count(".") == 2)
 
+        # 1b. `none` app: tool error (isError=True, no gateway error code).
+        res_err = await _call(mcp_url, plain_token, {"text": "hello", "fail": True})
+        err_meta = getattr(res_err, "meta", None)
+        has_gateway_code = bool(err_meta and "gateway" in err_meta and "code" in err_meta["gateway"])
+        check("none: tool error has isError=True", res_err.isError is True,
+              res_err.content[0].text if res_err.content else "")
+        check("none: tool error has no gateway error code in meta", not has_gateway_code,
+              str(err_meta))
+        check("none: tool error content preserved",
+              bool(res_err.content) and res_err.content[0].text == "tool domain error",
+              res_err.content[0].text if res_err.content else "")
+
         # 2. `end-to-end` app, v2 associated data.
         fields = e2e.header(user_id=owner, client_id=sealed.wrn, service=SERVICE,
                             tool="whoami")
@@ -240,6 +255,27 @@ async def main() -> int:
                   (inner.get("principal"), inner.get("app")) == (owner, sealed.wrn),
                   str(inner))
             check("e2e: encryption is end-to-end", inner.get("encryption") == "end-to-end")
+
+        # 2b. `end-to-end` app: tool error (authenticated in AAD, no gateway error code).
+        fields_err = e2e.header(user_id=owner, client_id=sealed.wrn, service=SERVICE,
+                                tool="whoami")
+        envelope_err = e2e.seal({"text": "sealed hello", "fail": True}, sender=client_key,
+                                recipient_public_raw=service_key.public_raw, fields=fields_err)
+        res_e2e_err = await _call(mcp_url, sealed_token, {"e2e": envelope_err})
+        e2e_err_meta = getattr(res_e2e_err, "meta", None)
+        e2e_has_gw_code = bool(e2e_err_meta and "gateway" in e2e_err_meta and "code" in e2e_err_meta["gateway"])
+        check("e2e: tool error has isError=True", res_e2e_err.isError is True,
+              res_e2e_err.content[0].text[:120] if res_e2e_err.content else "")
+        check("e2e: tool error has no gateway error code in meta", not e2e_has_gw_code,
+              str(e2e_err_meta))
+        if res_e2e_err.isError and res_e2e_err.content:
+            reply_err = json.loads(res_e2e_err.content[0].text)
+            request_id_err = seen[-1].request_id
+            opened_err = e2e.open_envelope(reply_err, recipient=client_key,
+                                           sender_public_raw=service_key.public_raw,
+                                           fields=e2e.reply_header(fields_err, request_id_err, is_error=True))
+            check("e2e: tool error content opened", opened_err[0]["text"] == "tool domain error",
+                  str(opened_err))
     finally:
         await service.stop()
         if runner is not None:

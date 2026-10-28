@@ -20,7 +20,7 @@ changed from 0.1.x and how to migrate.
 ## Adopting it
 
 ```python
-from gateway_client import Caller, GatewayService, ServiceError
+from gateway_client import Caller, GatewayService, ServiceError, ToolResult
 
 TOOLS = [{"name": "add", "description": "Add two numbers.",
           "inputSchema": {"type": "object", "required": ["a", "b"],
@@ -33,6 +33,9 @@ async def on_call(tool: str, arguments: dict, caller: Caller):
     # caller.claims     the verified claims; caller.encryption; caller.request_id
     if tool == "add":
         return str(arguments["a"] + arguments["b"])     # str, content blocks, or any JSON
+    # Application tool error (MCP CallToolResult with isError=true, no gateway error code):
+    # return ToolResult("domain error message", is_error=True)
+    # or return {"isError": True, "content": "domain error message"}
     raise ServiceError("not_found", f"unknown tool: {tool}")
 
 async def on_read(uri: str, caller: Caller):

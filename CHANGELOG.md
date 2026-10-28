@@ -3,6 +3,21 @@
 The version follows semantic versioning; before 1.0.0 a breaking change
 raises the minor version.
 
+## [0.4.1] - 2026-10-28
+
+Application-level MCP tool errors (`isError=true`) on Contract v2 (#14).
+
+### Added
+
+- `ToolResult(content=..., is_error=False)` helper class in `gateway_client` and `gateway_client.protocol`.
+- Support for returning `ToolResult(..., is_error=True)` or mappings containing `{"isError": True, "content": ...}` (or `"is_error": True`) from `on_call` handlers without stringifying the dictionary.
+- When `is_error` is True:
+  - In `none` mode: the `result` frame carries `is_error: True` and unnested `payload`.
+  - In `end-to-end` mode: `is_error: True` is included in the frame and cryptographically authenticated within the HPKE envelope associated data (`reply_header`), ensuring the error status cannot be flipped in transit without failing AEAD authentication.
+  - The gateway emits `CallToolResult(isError=True)` without attaching a gateway error code (`_meta.gateway.code`).
+  - Request tracing emits `call.end` with `outcome="tool_error"`.
+- Existing backends that never set `isError` see zero wire or behavioral changes.
+
 ## [0.4.0] - 2026-10-28
 
 Additive request tracing and structured logging on service contract version 2 (#20).

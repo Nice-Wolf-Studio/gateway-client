@@ -25,7 +25,7 @@ from helpers import (
     serve_until,
 )
 
-from gateway_client import Caller, Config, GatewayService, KeyPair, ServiceError, e2e
+from gateway_client import Caller, Config, GatewayService, KeyPair, ServiceError, ToolResult, e2e
 from gateway_client.protocol import Backoff
 from gateway_client.service import TOKEN_REFUSED
 
@@ -1650,4 +1650,119 @@ def test_handler_raised_crlf_request_id_escaped(caplog):
     log_text = "\n".join(r.getMessage() for r in client_records)
     assert "r\\r\\nraise\\n1" in log_text
     assert "handler raised RuntimeError" in log_text
+
+
+# --- tool errors (is_error / isError) (Issue #14) ---------------------------------
+
+@pytest.mark.parametrize("ret_val,expected_content", [
+    ({"isError": True, "content": [{"type": "text", "text": "chat not found"}]},
+     [{"type": "text", "text": "chat not found"}]),
+    ({"is_error": True, "content": "failed to send"},
+     [{"type": "text", "text": "failed to send"}]),
+    (ToolResult("tool helper error", is_error=True),
+     [{"type": "text", "text": "tool helper error"}]),
+    (ToolResult([{"type": "text", "text": "structured error"}], isError=True),
+     [{"type": "text", "text": "structured error"}]),
+])
+def test_none_call_tool_error(caplog, ret_val, expected_content):
+    async def on_call(tool, arguments, caller):
+        return ret_val
+
+    with caplog.at_level(logging.DEBUG):
+        _, replies = run(_one_exchange([_call(payload={"text": "hi"}, request_id="r-err-1")],
+                                       service_kwargs={"on_call": on_call}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "result"
+    assert reply["request_id"] == "r-err-1"
+    assert reply["encryption"] == "none"
+    assert reply["is_error"] is True
+    assert "code" not in reply
+    assert reply["payload"] == expected_content
+
+    # Trace outcome coordinate with #20
+    ends = [r for r in caplog.records if getattr(r, "gw_fields", {}).get("event") == "call.end"]
+    assert len(ends) == 1
+    end_fields = ends[0].gw_fields
+    assert end_fields["outcome"] == "tool_error"
+    assert "error_code" not in end_fields
+    # Verify metadata-only invariant: error content must never be logged in call.end
+    assert "chat not found" not in ends[0].getMessage()
+    assert "failed to send" not in ends[0].getMessage()
+    assert "tool helper error" not in ends[0].getMessage()
+
+
+def test_none_call_success_has_no_is_error_flag():
+    async def on_call(tool, arguments, caller):
+        return "all good"
+
+    _, replies = run(_one_exchange([_call(payload={"text": "hi"})],
+                                   service_kwargs={"on_call": on_call}))
+    assert replies[0]["type"] == "result"
+    assert "is_error" not in replies[0]
+    assert replies[0]["payload"] == [{"type": "text", "text": "all good"}]
+
+
+def test_e2e_call_tool_error_cryptographically_authenticated(caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    frame, fields = _e2e_call(client, service_key.public_raw, {"text": "hi"}, request_id="r-e2e-err")
+
+    async def on_call(tool, arguments, caller):
+        return ToolResult("secret domain error", is_error=True)
+
+    with caplog.at_level(logging.DEBUG):
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key, "on_call": on_call}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "result"
+    assert reply["encryption"] == "end-to-end"
+    assert reply["is_error"] is True
+    assert "code" not in reply
+
+    # 1. Opening with is_error=True succeeds
+    opened = e2e.open_envelope(reply["payload"], recipient=client,
+                               sender_public_raw=service_key.public_raw,
+                               fields=e2e.reply_header(fields, reply["request_id"], is_error=True))
+    assert opened == [{"type": "text", "text": "secret domain error"}]
+
+    # 2. Opening with is_error=False fails AEAD check (tamper resistance)
+    with pytest.raises(e2e.E2EError):
+        e2e.open_envelope(reply["payload"], recipient=client,
+                           sender_public_raw=service_key.public_raw,
+                           fields=e2e.reply_header(fields, reply["request_id"], is_error=False))
+
+    # 3. Call log outcome
+    ends = [r for r in caplog.records if getattr(r, "gw_fields", {}).get("event") == "call.end"]
+    assert len(ends) == 1
+    assert ends[0].gw_fields["outcome"] == "tool_error"
+    assert "error_code" not in ends[0].gw_fields
+    assert "secret domain error" not in ends[0].getMessage()
+
+
+def test_e2e_call_success_fails_if_opened_as_error():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    frame, fields = _e2e_call(client, service_key.public_raw, {"text": "hi"}, request_id="r-e2e-ok")
+
+    async def on_call(tool, arguments, caller):
+        return "regular result"
+
+    _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key, "on_call": on_call}))
+    reply = replies[0]
+    assert reply["type"] == "result"
+    assert "is_error" not in reply
+
+    # Opening as regular (is_error=False) succeeds
+    opened = e2e.open_envelope(reply["payload"], recipient=client,
+                               sender_public_raw=service_key.public_raw,
+                               fields=e2e.reply_header(fields, reply["request_id"]))
+    assert opened == [{"type": "text", "text": "regular result"}]
+
+    # Opening with is_error=True fails AEAD check
+    with pytest.raises(e2e.E2EError):
+        e2e.open_envelope(reply["payload"], recipient=client,
+                           sender_public_raw=service_key.public_raw,
+                           fields=e2e.reply_header(fields, reply["request_id"], is_error=True))
+
 

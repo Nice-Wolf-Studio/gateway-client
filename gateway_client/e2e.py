@@ -217,10 +217,14 @@ def header(*, user_id: str, client_id: str, service: str, tool: str | None = Non
     return fields
 
 
-def reply_header(request_header: dict[str, Any], request_id: str) -> dict[str, Any]:
-    """A reply's associated-data fields: the request's plus `request_id` and
-    `direction: "reply"`."""
-    return {**request_header, "request_id": request_id, "direction": "reply"}
+def reply_header(request_header: dict[str, Any], request_id: str,
+                 is_error: bool = False) -> dict[str, Any]:
+    """A reply's associated-data fields: the request's plus `request_id`,
+    `direction: "reply"`, and optional `is_error: True`."""
+    fields = {**request_header, "request_id": request_id, "direction": "reply"}
+    if is_error:
+        fields["is_error"] = True
+    return fields
 
 
 def associated_data(fields: dict[str, Any], nonce: str, sent_at: int) -> bytes:
