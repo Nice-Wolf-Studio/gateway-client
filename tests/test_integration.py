@@ -88,3 +88,26 @@ def test_example_service_registers_and_answers_one_call():
         "type": "result", "request_id": request_id, "encryption": "none",
         "payload": [{"type": "text", "text": f"gateway-client selftest ok: "
                      f"principal={PRINCIPAL} app={APP} encryption=none echo=hello"}]}
+
+
+def test_gateway_e2e_driver_service_and_grant():
+    """mcp-gateway `development` `gateway/wrn.py` `is_service_name` and
+    `gateway/access.py` `use_resource`: the real-gateway driver's service name
+    must be allowed in wolf-access and its user grant must target the user's
+    personal container rather than `PLATFORM_WRN`."""
+    import ast
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parent / "gateway_e2e_driver.py").read_text()
+    tree = ast.parse(source)
+    service = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "SERVICE" for t in node.targets)
+    )
+    assert isinstance(service, str)
+    assert re.fullmatch(r"[a-z][a-z0-9_]{1,61}[a-z0-9]", service) is not None
+    assert "__" not in service
+    assert "use_resource(owner)" in source
+    assert "PLATFORM_WRN" not in source
