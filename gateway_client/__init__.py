@@ -18,15 +18,22 @@ from .errors import (
     RegistrationRejected,
     ServiceError,
 )
+from .logs import (
+    JsonFormatter,
+    RequestIdFilter,
+    configure_logging,
+    current_request_id,
+)
 from .protocol import CONTRACT_VERSION
 from .service import Caller, GatewayService
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "BAD_ARGUMENTS", "CONTRACT_VERSION", "ERROR_CODES", "INTERNAL", "NOT_ALLOWED",
     "NOT_FOUND", "RATE_LIMITED", "TIMED_OUT", "UNAVAILABLE",
     "Caller", "CallerTokenVerifier", "Config", "ConfigError", "GatewayService",
-    "KeyPair", "KeySet", "RegistrationRejected", "ServiceError", "TokenRefused",
-    "VerifiedToken", "__version__",
+    "JsonFormatter", "KeyPair", "KeySet", "RegistrationRejected", "RequestIdFilter",
+    "ServiceError", "TokenRefused", "VerifiedToken", "__version__",
+    "configure_logging", "current_request_id",
 ]
