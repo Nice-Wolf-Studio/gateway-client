@@ -9,7 +9,7 @@ Status markers used on every rule below:
   "superseded by the v2 cutover" cites the code or gateway rule that differs.
 - **[proposed]**: a recommendation nobody has ruled on. Not a commitment.
 
-Anchors are against **`development` at `23e25d0`** (tags `v0.2.0` and `v0.2.1`; service contract
+Anchors are against **`development` at `23e25d0`** (tag `v0.2.0`; service contract
 version 2). `development` was created from `main` at that commit; `main` is the GitHub default
 branch. Which of the two PRs target is not stated in this repo's files (Q6). The library code at
 `23e25d0` is the code of `197f3b8`; `RELEASE.md` describes the `v0.1.1` -> `197f3b8` changes. Line
@@ -81,7 +81,10 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
    The gateway serves the prompts itself, filling the placeholders; there is no prompt handler.
 2. `service.run_forever()` or `await service.run()` [as-built] (`service.py:227-256`).
 3. Callbacks may be sync (run in a worker thread) or async [as-built] (`service.py:114-122`).
-   A tool result may be content blocks, a string, or any JSON value [as-built] (`protocol.py:94-101`).
+   A tool result may be content blocks, a string, any JSON value, a `ToolResult(content=..., is_error=True)`,
+   or a dict with `"isError": True` [as-built] (`protocol.py:204-250`). When `is_error` is True, the `result`
+   frame carries `is_error: True` (authenticated in HPKE associated data in `end-to-end` mode), yielding
+   `CallToolResult(isError=True)` to the MCP client without a gateway wire error code (`_meta.gateway.code`).
 
 ### 2.3 Registration handshake (contract v2, auth)
 
@@ -119,6 +122,7 @@ identity reaches a backend no other way [as-built, gateway] (`mcp-gateway:gatewa
 | `none` mode | Refused `not_allowed` if the connected app (`act`) was seen in end-to-end mode by **this process**. The local refusal of a `none` call to a `requires_end_to_end` role was removed in v0.2.0; which tools need end-to-end is wolf-access's decision, enforced by the gateway. | `service.py:484-491`, `583`, `594`; `CHANGELOG.md:49-52`; `README.md:95` |
 | `end-to-end` mode | Check `client_kid` matches `client_public_key`; build the associated data from the verified token (`user_id` = `sub`, `client_id` = `act`, `service` = `aud`, `contract_version: 2`); open the envelope (kid must name the client's key; tampered/undecryptable or bound to other ids → `bad_arguments`; `sent_at` > 5 min off or nonce reused by that app within 10 min → `not_allowed`); validate arguments against `inputSchema`; seal the reply (or error text) to the client key. A token refusal is sent unsealed. | `service.py:523-535`, `575-592`, `609-624`; `e2e.py:191-211`, `285-316` |
 | Handler error | `ServiceError(code, msg)` sends that code; any other exception sends `internal` with text `internal error`, exception text never sent or logged. | `service.py:599-607` |
+| Tool error (`isError`) | Returning `ToolResult(content=..., is_error=True)` or a dict `{"isError": True, "content": ...}` sends a `result` frame with `is_error: True` (in `end-to-end` mode, cryptographically authenticated in the HPKE AAD via `reply_header(..., is_error=True)`). Yields `CallToolResult(isError=True)` to the caller without `_meta.gateway.code`. Traced with `outcome="tool_error"`. | `protocol.py:204-250`, `service.py:766-770`, `e2e.py:220-224` |
 | Legacy calls | Removed in v0.2.0: a legacy call carries no caller token, so it could never be served. | `CHANGELOG.md:53-56` |
 
 **Known gap: resolved in v0.1.1, superseded in v0.2.0** [as-built, `development` `23e25d0`]. At
@@ -137,18 +141,19 @@ and logged once at WARNING with its request id and the failed check, never the t
 ### 2.5 Data
 
 The library stores nothing on disk except an optionally created private-key file
-(`config.py:99-113`). In memory: the end-to-end replay nonces per connected app for 10 minutes
+(`config.py:99-113`) and an optional downgrade pin store file (`pins.py:FilePinStore`,
+`config.py:pin_store_file`). In memory: the end-to-end replay nonces per connected app for 10 minutes
 (`e2e.py:84`, `262-283`; `service.py:591`), the set of connected app WRNs seen in end-to-end mode
-(`service.py:190`), the accepted caller-token `jti`s until each token's `exp` plus leeway
-(`caller_token.py:227`, `264`), and the cached gateway key set (`caller_token.py:147-148`). All are
-lost on restart. The nonce loss is bounded by the 5-minute `sent_at` limit (`e2e.py:83`,
-`299-300`); the `jti` loss by the token lifetime of at most 60 s plus leeway
-(`caller_token.py:61-62`, `294-297`); the downgrade pin loss is not bounded. Tracked in
-[#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3); see open question Q2.
+(`service.py:272`), the accepted caller-token `jti`s until each token's `exp` plus leeway
+(`caller_token.py:227`, `264`), and the cached gateway key set (`caller_token.py:147-148`).
+Without an opt-in pin store, all are lost on restart. The nonce loss is bounded by the 5-minute
+`sent_at` limit (`e2e.py:83`, `299-300`); the `jti` loss by the token lifetime of at most 60 s plus
+leeway (`caller_token.py:61-62`, `294-297`); downgrade pin persistence is opt-in via `pin_store`
+or `SERVICE_PIN_STORE_FILE` (see resolved question Q2). Tracked in [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3).
 
 ### 2.6 Distribution and CI
 
-- Installed from git by tag: `gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.2.0` [as-built] (`README.md:11`). Nothing deploys; each service pins a tag. Tags `v0.2.0` and `v0.2.1` both point at `23e25d0`, whose package version is `0.2.0` (`pyproject.toml:7`, `__init__.py:24`).
+- Installed from git by tag: `gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.2.0` [as-built] (`README.md:11`). Nothing deploys; each service pins a tag. Tag `v0.2.0` points at `23e25d0`, whose package version is `0.2.0` (`pyproject.toml:7`, `__init__.py:24`).
 - CI: one `pytest` job in a Python 3.10 / 3.12 matrix on every push and PR, so the checks report as `pytest (3.10)` and `pytest (3.12)` [as-built] (`.github/workflows/ci.yml:1-17`). No workflow creates or gates a tag. The tests run against an in-process WebSocket server on 127.0.0.1 with an in-process token issuer (`README.md:140-142`). `tests/test_gateway_e2e.py` runs the library against the real gateway and is skipped unless `MCP_GATEWAY_DIR` and `TEST_DATABASE_URL` are set, so CI does not run it (`README.md:144-156`).
 - Classic branch protection is still absent on `main` and `development` (GitHub API `branches/<branch>/protection` answers 404 at time of writing). Repository rulesets `platform-main` and `platform-development` (created 2026-10-24, active) cover them: no deletion, no force-push, changes through a PR with no approving review required, and required checks `pytest (3.10)` and `pytest (3.12)` on an up-to-date branch (GitHub API `rulesets/25791452`, `rulesets/25794050`). Issue [#4](https://github.com/Nice-Wolf-Studio/gateway-client/issues/4) is still open.
 
@@ -224,7 +229,7 @@ arise here.
 ## 5. Open questions
 
 - **Q1. Resolved by v0.1.1** (`b4b05a2`, #2 closed): a v1 call or read without valid caller ids is refused before the handler runs, with `not_allowed`. Superseded in v0.2.0 by the caller-token check: no frame reaches a handler without a verified `caller_token` (`service.py:537-548`, `568`). Question was: should a v1 call or read with no `caller` (or no `user_id`/`client_id`) be refused before the handler runs, and if so with which error code (`bad_arguments` or `internal`)?
-- **Q2.** Should the end-to-end downgrade pin (connected app WRNs seen in end-to-end mode, `service.py:190`) survive a restart, and if so where is it stored, given the library stores nothing today? Tracked in #3.
+- **Q2. Resolved:** Default behavior: In-memory per-process pinning is the default, maintaining the zero-disk-dependency stateless invariant and avoiding permanent breakage of legitimate user-initiated encryption mode switches in `mcp-gateway` (`PUT /api/v1/clients/{id}/encryption`). Opt-in persistence: `GatewayService` supports an optional `pin_store` parameter (or `SERVICE_PIN_STORE_FILE` path in config) for deployments that require cross-restart persistence. Pin stores support checking `app in store`, adding `store.add(app)`, and optionally unpinning `store.remove(app)` or `clear()`. Tracked in #3.
 - **Q3.** Which of options (a), (b), (c) in 3.3 links this library to the wolf-access client, or something else?
 - **Q4.** Does the caller frame need an acting-agent / sponsor field or a consistency token for wolf-access, and if so is that a contract v2? Contract v2 shipped with a GW-3 token carrying `sub` (the principal: a user, or the agent the app acts for), `act` (the connected app WRN), `aud`, `iat`, `exp`, `jti`, and no sponsor or consistency-token field (`mcp-gateway:gateway/caller_token.py:23-31`; `service.py:73-75`). Whether one is needed is still open.
 - **Q5.** Should the library enforce the decided not-found rule for resources the caller has no role on, or only document it? Under v2 the library holds no roles at all (`protocol.py:30-38`).

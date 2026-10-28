@@ -8,6 +8,7 @@
 | `SERVICE_PRIVATE_KEY` | base64url raw X25519 private key. |
 | `SERVICE_PRIVATE_KEY_FILE` | A file holding it (read if present, created 0600 if not). |
 | `GATEWAY_JWKS_URL` | The gateway's key set for GW-3 caller tokens (default: derived from `GATEWAY_BACKEND_URL`, `wss://host/backend` -> `https://host/.well-known/jwks.json`). |
+| `SERVICE_PIN_STORE_FILE` | Optional file path for persisting end-to-end downgrade pins across restarts. |
 
 When neither key variable is set, a key pair is generated and the private
 key printed ONCE to stderr with instructions; the gateway pins the public key
@@ -36,6 +37,7 @@ class Config:
     credential: str = field(repr=False)
     key: KeyPair
     jwks_url: str | None = None
+    pin_store_file: Path | None = None
 
     @property
     def key_set_url(self) -> str:
@@ -47,6 +49,7 @@ class Config:
              credential: str | None = None, private_key: str | KeyPair | None = None,
              private_key_file: str | os.PathLike | None = None,
              jwks_url: str | None = None,
+             pin_store_file: str | os.PathLike | None = None,
              env: Mapping[str, str] | None = None,
              stderr: TextIO | None = None) -> "Config":
         """Arguments win over the environment. Raises ConfigError."""
@@ -64,8 +67,13 @@ class Config:
         jwks_url = (jwks_url or env.get("GATEWAY_JWKS_URL") or "").strip() or None
         if jwks_url is not None and not jwks_url.startswith(("https://", "http://")):
             raise ConfigError("GATEWAY_JWKS_URL must be an https:// or http:// URL")
+        if pin_store_file is not None:
+            pin_path: Path | None = Path(pin_store_file)
+        else:
+            raw_pin = (env.get("SERVICE_PIN_STORE_FILE") or "").strip()
+            pin_path = Path(raw_pin) if raw_pin else None
         return cls(url=url, service_name=service_name, credential=credential, key=key,
-                   jwks_url=jwks_url)
+                   jwks_url=jwks_url, pin_store_file=pin_path)
 
 
 def _load_key(private_key: str | KeyPair | None, key_file: str | os.PathLike | None,

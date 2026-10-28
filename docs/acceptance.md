@@ -1,7 +1,7 @@
 # gateway-client: acceptance criteria
 
 Each criterion can fail. "Fake gateway" means the in-process WebSocket server the tests use
-(`tests/helpers.py`). Anchors are against `development` at `23e25d0` (tags `v0.2.0` and `v0.2.1`;
+(`tests/helpers.py`). Anchors are against `development` at `23e25d0` (tag `v0.2.0`;
 service contract version 2). AC 24 keeps its v0.1.1 history (anchored at `b4b05a2`) and states
 the v0.2.0 criterion. AC 1-20 and AC 24 are as-built behavior; AC 21-23 check decided rules that
 apply to this library, and AC 21-22 carry a "superseded by the v2 cutover" note where contract v2
@@ -67,4 +67,4 @@ criterion until that question is answered. Each states the criterion it would be
 answer is yes [proposed].
 
 - **D1: resolved.** Issue [#2](https://github.com/Nice-Wolf-Studio/gateway-client/issues/2) and Q1 were resolved by v0.1.1 (`b4b05a2`) with code `not_allowed`. The criterion is now AC 24.
-- **D2** (issue [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3), open question Q2 in `docs/spec.md`). Today the set of connected app WRNs (`act`) seen in end-to-end mode is in memory only (`service.py:190`, `489`, `583`), so after a restart a `none` call from such an app is accepted. If Q2 is answered yes, the criterion would be: after a `GatewayService` restart, a `none` call from a connected app that sent an end-to-end call before the restart answers `not_allowed`.
+- **D2: resolved** (issue [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3), open question Q2 in `docs/spec.md`). In-memory per-process pinning is the default, maintaining the zero-disk-dependency stateless invariant and avoiding permanent breakage of legitimate user-initiated encryption mode switches in `mcp-gateway`. For deployments that opt in to persistence via `pin_store` (or `SERVICE_PIN_STORE_FILE`), after a `GatewayService` restart, a `none` call whose connected app WRN (`caller.app`, verified `act` claim) was seen in `end-to-end` mode before the restart answers `not_allowed`. Connected apps never seen in `end-to-end` mode continue to be allowed.

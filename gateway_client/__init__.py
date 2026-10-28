@@ -18,15 +18,23 @@ from .errors import (
     RegistrationRejected,
     ServiceError,
 )
-from .protocol import CONTRACT_VERSION
+from .logs import (
+    JsonFormatter,
+    RequestIdFilter,
+    configure_logging,
+    current_request_id,
+)
+from .pins import FilePinStore
+from .protocol import CONTRACT_VERSION, ToolResult
 from .service import Caller, GatewayService
 
-__version__ = "0.3.0"
+__version__ = "0.4.2"
 
 __all__ = [
     "BAD_ARGUMENTS", "CONTRACT_VERSION", "ERROR_CODES", "INTERNAL", "NOT_ALLOWED",
     "NOT_FOUND", "RATE_LIMITED", "TIMED_OUT", "UNAVAILABLE",
-    "Caller", "CallerTokenVerifier", "Config", "ConfigError", "GatewayService",
-    "KeyPair", "KeySet", "RegistrationRejected", "ServiceError", "TokenRefused",
-    "VerifiedToken", "__version__",
+    "Caller", "CallerTokenVerifier", "Config", "ConfigError", "FilePinStore", "GatewayService",
+    "JsonFormatter", "KeyPair", "KeySet", "RegistrationRejected", "RequestIdFilter",
+    "ServiceError", "TokenRefused", "ToolResult", "VerifiedToken", "__version__",
+    "configure_logging", "current_request_id",
 ]

@@ -28,17 +28,19 @@ import inspect
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, MutableSet
 
 import jsonschema
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from . import caller_token, e2e
+from . import caller_token, e2e, logs
 from .caller_token import CallerTokenVerifier, KeySet, TokenRefused, VerifiedToken
 from .config import Config
+from .pins import FilePinStore
 from .errors import (
     BAD_ARGUMENTS,
     INTERNAL,
@@ -48,7 +50,16 @@ from .errors import (
     RegistrationRejected,
     ServiceError,
 )
-from .protocol import Backoff, Declaration, content_blocks, resource_contents
+from .logs import (
+    JsonFormatter,
+    RequestIdFilter,
+    _safe_str,
+    apply_env_format,
+    configure_logging,
+    current_request_id,
+    request_scope,
+)
+from .protocol import Backoff, Declaration, ToolResult, content_blocks, parse_tool_result, resource_contents
 
 log = logging.getLogger("gateway_client")
 # The WebSocket library logs every frame at DEBUG, and frames carry the
@@ -69,7 +80,9 @@ class Caller:
     """Who is calling, from the call's verified GW-3 caller token and
     nothing else. A call or read reaches the handler only after its token
     passed every check (signature, audience, expiry, required claims, no
-    replay), so `principal` and `app` are always non-blank strings.
+    replay), so `principal` and `app` are always non-blank strings with no
+    leading or trailing whitespace and no Unicode `Cc` (control) or `Cf`
+    (format) characters, passed through unchanged without normalization.
 
     - `principal`: the principal WRN the call acts as (the token's `sub`):
       a user, or the agent the app acts for.
@@ -110,6 +123,14 @@ class _Attempt:
     outcome: _Outcome
     reason: str | None = None
     close_code: int | None = None
+    close_reason: str | None = None
+
+
+class _Kid(str):
+    """The key id as a string, also callable if invoked as a method."""
+
+    def __call__(self) -> str:
+        return str(self)
 
 
 async def _invoke(fn: Callable[..., Any], *args: Any) -> Any:
@@ -133,6 +154,56 @@ def _parse(raw: Any) -> dict[str, Any] | None:
 
 def _close_code(exc: ConnectionClosed) -> int | None:
     return exc.rcvd.code if exc.rcvd is not None else None
+
+
+_escape_crlf = _safe_str
+
+
+class _CallLog:
+    """The `call.start` / `call.end` pair for one verified call or read."""
+
+    def __init__(self, *, request_id: Any, is_call: bool, target: Any,
+                 caller: Caller, encryption: Any, started: float) -> None:
+        self.request_id = request_id
+        self.is_call = is_call
+        self.target = target
+        self.caller = caller
+        self.encryption = encryption
+        self.started = started
+
+    def start(self) -> None:
+        fields: dict[str, Any] = {
+            "event": "call.start",
+            "request_id": self.request_id,
+            "target": self.target,
+            ("tool" if self.is_call else "uri"): self.target,
+            "principal": self.caller.principal,
+            "app": self.caller.app,
+            "encryption": self.encryption,
+        }
+        logs.emit(log, logging.INFO, "call.start", fields)
+
+    def end(self, outcome: str) -> None:
+        duration_ms = round((time.monotonic() - self.started) * 1000.0, 2)
+        fields: dict[str, Any] = {
+            "event": "call.end",
+            "request_id": self.request_id,
+            "target": self.target,
+            ("tool" if self.is_call else "uri"): self.target,
+            "principal": self.caller.principal,
+            "app": self.caller.app,
+            "encryption": self.encryption,
+            "duration_ms": duration_ms,
+            "outcome": outcome,
+        }
+        if outcome not in ("result", "tool_error"):
+            fields["error_code"] = outcome
+        level = (
+            logging.INFO
+            if outcome == "result"
+            else (logging.ERROR if outcome == INTERNAL else logging.WARNING)
+        )
+        logs.emit(log, level, "call.end", fields)
 
 
 class GatewayService:
@@ -170,6 +241,7 @@ class GatewayService:
                  resources: Iterable[dict] = (), on_read: OnRead | None = None,
                  prompts: Iterable[dict] = (), instructions: str | None = None,
                  config: Config | None = None,
+                 pin_store: MutableSet[str] | None = None,
                  max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
                  reply_timeout: float = DEFAULT_REPLY_TIMEOUT,
                  sleep: Callable[[float], Awaitable[Any]] | None = None,
@@ -198,7 +270,12 @@ class GatewayService:
         self._sleep_fn = sleep
         self._backoff = Backoff(rand)
         self._replay = e2e.ReplayGuard()
-        self._pinned: set[str] = set()   # app WRNs seen in end-to-end mode
+        if pin_store is not None:
+            self._pinned: MutableSet[str] = pin_store
+        elif self.config.pin_store_file is not None:
+            self._pinned = FilePinStore(self.config.pin_store_file)
+        else:
+            self._pinned = set()
         self._ws: ClientConnection | None = None     # the registered connection
         self._conn: ClientConnection | None = None   # any open connection
         self._mode: str | None = None
@@ -218,8 +295,16 @@ class GatewayService:
         return self.config.key.public_b64
 
     @property
-    def kid(self) -> str:
-        return self.config.key.kid
+    def kid(self) -> _Kid:
+        return _Kid(self.config.key.kid)
+
+    @property
+    def _service(self) -> str:
+        return self.config.service_name
+
+    @property
+    def _url(self) -> str:
+        return self.config.url
 
     @property
     def mode(self) -> str | None:
@@ -235,6 +320,11 @@ class GatewayService:
     def registered(self) -> bool:
         return self._mode is not None
 
+    @property
+    def pinned(self) -> MutableSet[str]:
+        """The store or set of connected app WRNs seen in end-to-end mode."""
+        return self._pinned
+
     def run_forever(self) -> None:
         """Blocking entry point: `asyncio.run(self.run())`, quiet on Ctrl-C."""
         try:
@@ -244,6 +334,7 @@ class GatewayService:
 
     async def run(self) -> None:
         """Connect, register and serve, reconnecting until `stop()`."""
+        apply_env_format()
         self._stop_event = asyncio.Event()
         self._registered_event = self._registered_event or asyncio.Event()
         last_problem: str | None = None
@@ -253,15 +344,18 @@ class GatewayService:
                 break
             if attempt.outcome is _Outcome.REGISTERED:
                 last_problem = None
-                log.info("connection to the gateway ended; reconnecting")
+                log.info("service '%s': connection to the gateway ended (code=%s, reason=%s); "
+                         "reconnecting", self._service, attempt.close_code,
+                         _safe_str(attempt.close_reason))
             elif attempt.reason != last_problem:
                 last_problem = attempt.reason
                 if attempt.outcome is _Outcome.REJECTED:
-                    log.error("registration rejected: %s; retrying with backoff up to "
-                              "300 s", attempt.reason)
+                    log.error("service '%s' kid '%s' at %s: registration rejected: %s; "
+                              "retrying with backoff up to 300 s",
+                              self._service, self.kid, self._url, _safe_str(attempt.reason))
                 else:
                     log.warning("gateway connection problem: %s; retrying with backoff "
-                                "up to 30 s", attempt.reason)
+                                "up to 30 s", _safe_str(attempt.reason))
             delay = self._backoff.next_delay(rejected=attempt.outcome is _Outcome.REJECTED)
             await self._sleep(delay)
         await self._drain()
@@ -374,9 +468,10 @@ class GatewayService:
                         return _Attempt(_Outcome.FAILED, "no reply to register within "
                                         f"{self._reply_timeout:g} s")
                     return _Attempt(_Outcome.NO_REPLY, "connection closed without a reply "
-                                    f"to register (code {code})", code)
+                                    f"to register (code {code})", code, ws.close_reason)
                 if reply["type"] == "rejected":
-                    return _Attempt(_Outcome.REJECTED, str(reply.get("reason")))
+                    return _Attempt(_Outcome.REJECTED, str(reply.get("reason")),
+                                    close_code=ws.close_code, close_reason=ws.close_reason)
                 self._on_registered(ws)
                 try:
                     await self._serve(ws)
@@ -384,8 +479,10 @@ class GatewayService:
                     self._on_disconnected()
                 if self._rejected_on_update is not None:
                     reason, self._rejected_on_update = self._rejected_on_update, None
-                    return _Attempt(_Outcome.REJECTED, reason)
-                return _Attempt(_Outcome.REGISTERED)
+                    return _Attempt(_Outcome.REJECTED, reason,
+                                    close_code=ws.close_code, close_reason=ws.close_reason)
+                return _Attempt(_Outcome.REGISTERED, close_code=ws.close_code,
+                                close_reason=ws.close_reason)
         except (OSError, asyncio.TimeoutError, WebSocketException) as exc:
             return _Attempt(_Outcome.FAILED, f"cannot connect ({type(exc).__name__})")
         finally:
@@ -496,12 +593,26 @@ class GatewayService:
     # --- requests --------------------------------------------------------------------
 
     async def _answer(self, ws: ClientConnection, frame: dict[str, Any]) -> None:
-        reply = await self._reply(frame)
+        """Reply to one request. Never ends with an unhandled exception: a
+        failure building the reply is logged and answered with a plain
+        `internal` error, so the gateway is not left waiting."""
+        request_id = frame.get("request_id")
+        try:
+            reply = await self._reply(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("request_id=%s: could not build the reply (%s); answering plain "
+                      "error %s", _safe_str(request_id), type(exc).__name__, INTERNAL)
+            reply = {"type": "error", "request_id": request_id,
+                     "encryption": frame.get("encryption"), "code": INTERNAL,
+                     "payload": "internal error"}
         try:
             await self._send(ws, reply)
         except ConnectionClosed:
-            log.warning("request_id=%s: reply not sent, the connection closed",
-                        frame.get("request_id"))
+            log.warning("request_id=%s: reply not sent, the connection closed", _safe_str(request_id))
+        except Exception as exc:
+            log.error("request_id=%s: reply not sent (%s)", _safe_str(request_id), type(exc).__name__)
 
     def _check_target(self, is_call: bool, target: Any) -> dict[str, Any]:
         """The declared tool or resource, else ServiceError(not_found)."""
@@ -522,16 +633,17 @@ class GatewayService:
                                             "plaintext call is refused")
 
     async def _run_handler(self, is_call: bool, target: str, declared: dict[str, Any],
-                           arguments: Any, caller: Caller) -> list[Any]:
+                           arguments: Any, caller: Caller) -> tuple[list[Any], bool]:
         if is_call:
             if arguments is None:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ServiceError(BAD_ARGUMENTS, "arguments must be a JSON object")
-            return content_blocks(await _invoke(self._on_call, target, arguments, caller))
+            raw = await _invoke(self._on_call, target, arguments, caller)
+            return parse_tool_result(raw)
         assert self._on_read is not None
         value = await _invoke(self._on_read, target, caller)
-        return resource_contents(value, target, declared.get("mimeType") or "text/plain")
+        return resource_contents(value, target, declared.get("mimeType") or "text/plain"), False
 
     @staticmethod
     def _check_schema(declared: dict[str, Any], arguments: Any) -> None:
@@ -554,7 +666,9 @@ class GatewayService:
     @staticmethod
     def _client_key(frame: dict[str, Any]) -> bytes:
         """The client's raw public key from an `end-to-end` frame, checked
-        against `client_kid`."""
+        against `client_kid` and refused when a reply cannot be sealed to it
+        (a small-order point such as all zeros): the refusal is then plain,
+        not sealed, and the caller's app is not pinned."""
         try:
             raw = e2e.decode_public_key(frame.get("client_public_key"), "client_public_key")
         except ValueError:
@@ -563,6 +677,11 @@ class GatewayService:
         if frame.get("client_kid") != e2e.key_id(raw):
             raise ServiceError(BAD_ARGUMENTS, "client_kid does not match "
                                               "client_public_key")
+        try:
+            e2e.check_public_key(raw)
+        except ValueError:
+            raise ServiceError(BAD_ARGUMENTS, "client_public_key cannot be used for "
+                                              "end-to-end encryption") from None
         return raw
 
     async def _verify_caller(self, frame: dict[str, Any]) -> VerifiedToken:
@@ -573,8 +692,11 @@ class GatewayService:
         try:
             return await self._verifier.verify(frame.get("caller_token"))
         except TokenRefused as exc:
-            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
-                        frame.get("request_id"), exc.reason, exc.code)
+            log.warning("%s request_id=%s refused: %s; answering %s",
+                        _safe_str(frame.get("type")),
+                        _safe_str(frame.get("request_id")),
+                        _safe_str(exc.reason),
+                        exc.code)
             raise ServiceError(exc.code, TOKEN_UNCHECKED if exc.code == UNAVAILABLE
                                else TOKEN_REFUSED) from None
 
@@ -587,33 +709,53 @@ class GatewayService:
         sealed to the client; a token refusal is not (there is no verified
         identity to bind the associated data to), so the gateway relays it
         to the client as `internal`."""
+        with request_scope(frame.get("request_id")):
+            return await self._reply_logged(frame)
+
+    async def _reply_logged(self, frame: dict[str, Any]) -> dict[str, Any]:
         request_id = frame.get("request_id")
         encryption = frame.get("encryption")
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
-        log.info("%s request_id=%s %s=%s encryption=%s", frame.get("type"), request_id,
-                 "tool" if is_call else "uri", target, encryption)
+        log.info("%s request_id=%s %s=%s encryption=%s",
+                 _safe_str(frame.get("type")),
+                 _safe_str(request_id),
+                 "tool" if is_call else "uri",
+                 _safe_str(target),
+                 _safe_str(encryption))
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
         try:
             verified = await self._verify_caller(frame)
-            caller = Caller.from_token(verified, encryption=encryption,
-                                       request_id=request_id)
-            log.info("request_id=%s caller principal=%s app=%s", request_id,
-                     caller.principal, caller.app)
+        except ServiceError as exc:
+            log.info("request_id=%s answered error %s", _safe_str(request_id), exc.code)
+            return self._reply_frame("error", request_id, encryption, str(exc),
+                                     client_key, fields, code=exc.code)
+
+        caller = Caller.from_token(verified, encryption=encryption,
+                                   request_id=request_id)
+        call_log = _CallLog(
+            request_id=request_id,
+            is_call=is_call,
+            target=target,
+            caller=caller,
+            encryption=encryption,
+            started=time.monotonic(),
+        )
+        call_log.start()
+
+        try:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
-                # Key and associated data first, so even a refusal is sealed.
-                # The associated data comes from the verified token only.
                 client_key = self._client_key(frame)
+            declared = self._check_target(is_call, target)
+            if encryption == e2e.ENCRYPTION_E2E:
                 fields = e2e.header(
                     user_id=caller.principal, client_id=caller.app,
                     service=verified.claims["aud"], encryption=encryption,
                     **({"tool": target} if is_call else {"uri": target}))
                 self._pinned.add(caller.app)
-            declared = self._check_target(is_call, target)
-            if encryption == e2e.ENCRYPTION_E2E:
                 arguments = None
                 if is_call:
                     arguments = e2e.open_envelope(
@@ -624,32 +766,59 @@ class GatewayService:
             else:
                 self._check_plaintext_allowed(caller.app)
                 arguments = frame.get("payload")
-            payload = await self._run_handler(is_call, target, declared, arguments, caller)
-            return self._reply_frame("result", request_id, encryption, payload,
-                                     client_key, fields)
+            payload, is_error = await self._run_handler(is_call, target, declared, arguments, caller)
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
         except Exception as exc:  # the service's own failure: never leak its text
             log.warning("request_id=%s: handler raised %s; answering internal",
-                        request_id, type(exc).__name__)
+                        _safe_str(request_id), type(exc).__name__)
             code, message = INTERNAL, "internal error"
-        log.info("request_id=%s answered error %s", request_id, code)
-        return self._reply_frame("error", request_id, encryption, message, client_key,
-                                 fields, code=code)
+        else:
+            # Sealing happens outside the try: a seal failure is not the
+            # handler's, and _reply_frame answers it itself.
+            reply = self._reply_frame("result", request_id, encryption, payload,
+                                      client_key, fields, is_error=is_error)
+            outcome = (
+                ("tool_error" if is_error else "result")
+                if reply["type"] == "result"
+                else reply.get("code", INTERNAL)
+            )
+            call_log.end(outcome)
+            return reply
+
+        reply = self._reply_frame("error", request_id, encryption, message, client_key,
+                                  fields, code=code)
+        outcome = reply.get("code", code)
+        log.info("request_id=%s answered error %s", _safe_str(request_id), outcome)
+        call_log.end(outcome)
+        return reply
 
     def _reply_frame(self, ftype: str, request_id: Any, encryption: Any, payload: Any,
                      client_key: bytes | None, fields: dict[str, Any] | None,
-                     code: str | None = None) -> dict[str, Any]:
-        """`{type, request_id, encryption, [code,] payload}`; in `end-to-end`
+                     code: str | None = None, is_error: bool = False) -> dict[str, Any]:
+        """`{type, request_id, encryption, [code,] [is_error,] payload}`; in `end-to-end`
         the payload is sealed to the client when the client's key and the
         verified caller are known (else plain, which the gateway turns into
-        `internal`)."""
+        `internal`). Should sealing fail anyway, the reply is a plain
+        `error`: the same code and message for an error, `internal` for a
+        result (a result is never sent unsealed)."""
         if encryption == e2e.ENCRYPTION_E2E and client_key is not None and fields is not None:
-            payload = e2e.seal(payload, sender=self.config.key, recipient_public_raw=client_key,
-                               fields=e2e.reply_header(fields, str(request_id)))
+            try:
+                reply_fields = e2e.reply_header(fields, str(request_id), is_error=is_error)
+                payload = e2e.seal(payload, sender=self.config.key,
+                                   recipient_public_raw=client_key,
+                                   fields=reply_fields)
+            except Exception as exc:
+                if ftype != "error" or code is None:
+                    ftype, code, payload = "error", INTERNAL, "internal error"
+                    is_error = False
+                log.warning("request_id=%s: could not seal the reply (%s); answering "
+                            "plain error %s", _safe_str(request_id), type(exc).__name__, code)
         reply: dict[str, Any] = {"type": ftype, "request_id": request_id,
                                  "encryption": encryption}
         if code is not None:
             reply["code"] = code
+        if is_error and ftype == "result":
+            reply["is_error"] = True
         reply["payload"] = payload
         return reply

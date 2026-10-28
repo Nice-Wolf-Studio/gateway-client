@@ -137,6 +137,18 @@ def decode_public_key(text: Any, field: str = "public_key") -> bytes:
     return raw
 
 
+def check_public_key(raw: bytes) -> None:
+    """ValueError unless `raw` is an X25519 public key HPKE can use: one for
+    which the Diffie-Hellman shared secret is not all zeros. That refuses
+    the all-zero key and every other small-order point (and their
+    non-canonical encodings), which every private key maps to the zero
+    secret, so a throwaway private key decides it for all of them."""
+    try:
+        X25519PrivateKey.generate().exchange(X25519PublicKey.from_public_bytes(raw))
+    except (ValueError, TypeError):
+        raise ValueError("public key is a small-order X25519 point") from None
+
+
 # --- keys ------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -205,10 +217,14 @@ def header(*, user_id: str, client_id: str, service: str, tool: str | None = Non
     return fields
 
 
-def reply_header(request_header: dict[str, Any], request_id: str) -> dict[str, Any]:
-    """A reply's associated-data fields: the request's plus `request_id` and
-    `direction: "reply"`."""
-    return {**request_header, "request_id": request_id, "direction": "reply"}
+def reply_header(request_header: dict[str, Any], request_id: str,
+                 is_error: bool = False) -> dict[str, Any]:
+    """A reply's associated-data fields: the request's plus `request_id`,
+    `direction: "reply"`, and optional `is_error: True`."""
+    fields = {**request_header, "request_id": request_id, "direction": "reply"}
+    if is_error:
+        fields["is_error"] = True
+    return fields
 
 
 def associated_data(fields: dict[str, Any], nonce: str, sent_at: int) -> bytes:

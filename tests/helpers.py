@@ -97,9 +97,11 @@ async def send_json(ws: Any, frame: dict[str, Any]) -> None:
 
 
 def make_config(url: str, *, key: KeyPair | None = None,
-                jwks_url: str | None = None) -> Config:
+                jwks_url: str | None = None,
+                pin_store_file: Path | None = None) -> Config:
     return Config(url=url, service_name="svc", credential="CRED-s3cr3t-value",
-                  key=key or KeyPair.generate(), jwks_url=jwks_url)
+                  key=key or KeyPair.generate(), jwks_url=jwks_url,
+                  pin_store_file=pin_store_file)
 
 
 async def default_on_call(tool: str, arguments: dict, caller: Any) -> Any:
@@ -110,6 +112,7 @@ def make_service(url: str, *, issuer: Issuer | None = None,
                  on_call: Callable | None = None, on_read: Callable | None = None,
                  sleep: Callable | None = None, rand: Callable[[], float] = lambda: 1.0,
                  key: KeyPair | None = None, jwks_fetch: Callable | None = None,
+                 pin_store_file: Path | None = None,
                  **kwargs: Any) -> GatewayService:
     """A service whose key set is `issuer`'s (no HTTP)."""
     async def fast_sleep(_delay: float) -> None:
@@ -120,7 +123,7 @@ def make_service(url: str, *, issuer: Issuer | None = None,
     return GatewayService(
         tools=TOOLS, resources=RESOURCES,
         on_call=on_call or default_on_call, on_read=on_read,
-        config=make_config(url, key=key), jwks_fetch=jwks_fetch,
+        config=make_config(url, key=key, pin_store_file=pin_store_file), jwks_fetch=jwks_fetch,
         sleep=sleep or fast_sleep, rand=rand, reply_timeout=5.0, **kwargs)
 
 
