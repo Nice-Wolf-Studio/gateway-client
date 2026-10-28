@@ -112,6 +112,14 @@ class _Attempt:
     outcome: _Outcome
     reason: str | None = None
     close_code: int | None = None
+    close_reason: str | None = None
+
+
+class _Kid(str):
+    """The key id as a string, also callable if invoked as a method."""
+
+    def __call__(self) -> str:
+        return str(self)
 
 
 async def _invoke(fn: Callable[..., Any], *args: Any) -> Any:
@@ -231,8 +239,16 @@ class GatewayService:
         return self.config.key.public_b64
 
     @property
-    def kid(self) -> str:
-        return self.config.key.kid
+    def kid(self) -> _Kid:
+        return _Kid(self.config.key.kid)
+
+    @property
+    def _service(self) -> str:
+        return self.config.service_name
+
+    @property
+    def _url(self) -> str:
+        return self.config.url
 
     @property
     def mode(self) -> str | None:
@@ -266,12 +282,15 @@ class GatewayService:
                 break
             if attempt.outcome is _Outcome.REGISTERED:
                 last_problem = None
-                log.info("connection to the gateway ended; reconnecting")
+                log.info("service '%s': connection to the gateway ended (code=%s, reason=%s); "
+                         "reconnecting", self._service, attempt.close_code,
+                         _safe_str(attempt.close_reason))
             elif attempt.reason != last_problem:
                 last_problem = attempt.reason
                 if attempt.outcome is _Outcome.REJECTED:
-                    log.error("registration rejected: %s; retrying with backoff up to "
-                              "300 s", _safe_str(attempt.reason))
+                    log.error("service '%s' kid '%s' at %s: registration rejected: %s; "
+                              "retrying with backoff up to 300 s",
+                              self._service, self.kid, self._url, _safe_str(attempt.reason))
                 else:
                     log.warning("gateway connection problem: %s; retrying with backoff "
                                 "up to 30 s", _safe_str(attempt.reason))
@@ -387,9 +406,10 @@ class GatewayService:
                         return _Attempt(_Outcome.FAILED, "no reply to register within "
                                         f"{self._reply_timeout:g} s")
                     return _Attempt(_Outcome.NO_REPLY, "connection closed without a reply "
-                                    f"to register (code {code})", code)
+                                    f"to register (code {code})", code, ws.close_reason)
                 if reply["type"] == "rejected":
-                    return _Attempt(_Outcome.REJECTED, str(reply.get("reason")))
+                    return _Attempt(_Outcome.REJECTED, str(reply.get("reason")),
+                                    close_code=ws.close_code, close_reason=ws.close_reason)
                 self._on_registered(ws)
                 try:
                     await self._serve(ws)
@@ -397,8 +417,10 @@ class GatewayService:
                     self._on_disconnected()
                 if self._rejected_on_update is not None:
                     reason, self._rejected_on_update = self._rejected_on_update, None
-                    return _Attempt(_Outcome.REJECTED, reason)
-                return _Attempt(_Outcome.REGISTERED)
+                    return _Attempt(_Outcome.REJECTED, reason,
+                                    close_code=ws.close_code, close_reason=ws.close_reason)
+                return _Attempt(_Outcome.REGISTERED, close_code=ws.close_code,
+                                close_reason=ws.close_reason)
         except (OSError, asyncio.TimeoutError, WebSocketException) as exc:
             return _Attempt(_Outcome.FAILED, f"cannot connect ({type(exc).__name__})")
         finally:
