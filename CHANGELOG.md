@@ -3,6 +3,17 @@
 The version follows semantic versioning; before 1.0.0 a breaking change
 raises the minor version.
 
+## [0.4.2] - 2026-10-28
+
+Persistent downgrade pin store and owner decision on Q2/D2 (#3).
+
+### Added
+
+- `FilePinStore` in `gateway_client.pins` and exported from `gateway_client`: persistent `MutableSet[str]` storing pinned connected app WRNs with atomic writes and 0600 permissions.
+- `pin_store` parameter on `GatewayService`: accepts any `MutableSet[str]` (or store protocol supporting `in`, `add`, `discard`/`remove`, `clear`).
+- `SERVICE_PIN_STORE_FILE` environment variable and `pin_store_file` parameter in `Config` / `Config.load()`.
+- Recorded owner decision for docs/spec.md Q2 and docs/acceptance.md D2: in-memory per-process pinning is the default, maintaining the zero-disk-dependency stateless invariant and avoiding permanent breakage of legitimate user-initiated encryption mode switches in `mcp-gateway`; cross-restart persistence is opt-in via `pin_store` or `SERVICE_PIN_STORE_FILE`.
+
 ## [0.4.1] - 2026-10-28
 
 Application-level MCP tool errors (`isError=true`) on Contract v2 (#14).

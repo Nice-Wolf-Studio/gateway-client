@@ -79,3 +79,19 @@ def test_key_file_created_0600_then_reused(tmp_path):
     assert err.getvalue() == ""  # never printed when a file is used
     second = Config.load(env={**BASE, "SERVICE_PRIVATE_KEY_FILE": str(path)})
     assert second.key.public_raw == first.key.public_raw
+
+
+def test_pin_store_file_from_env_and_argument(tmp_path):
+    key = KeyPair.generate()
+    env = {**BASE, "SERVICE_PRIVATE_KEY": key.private_b64()}
+    assert Config.load(env=env).pin_store_file is None
+
+    pin_path = tmp_path / "pins.txt"
+    cfg_env = Config.load(env={**env, "SERVICE_PIN_STORE_FILE": str(pin_path)})
+    assert cfg_env.pin_store_file == pin_path
+
+    other_path = tmp_path / "other.txt"
+    cfg_arg = Config.load(env={**env, "SERVICE_PIN_STORE_FILE": str(pin_path)},
+                          pin_store_file=str(other_path))
+    assert cfg_arg.pin_store_file == other_path
+

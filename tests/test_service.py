@@ -25,7 +25,16 @@ from helpers import (
     serve_until,
 )
 
-from gateway_client import Caller, Config, GatewayService, KeyPair, ServiceError, ToolResult, e2e
+from gateway_client import (
+    Caller,
+    Config,
+    FilePinStore,
+    GatewayService,
+    KeyPair,
+    ServiceError,
+    ToolResult,
+    e2e,
+)
 from gateway_client.protocol import Backoff
 from gateway_client.service import TOKEN_REFUSED
 
@@ -823,6 +832,122 @@ def test_none_call_after_e2e_from_same_app_refused():
     assert replies[0]["type"] == "result"
     assert replies[1]["code"] == "not_allowed"
     assert replies[2]["type"] == "result"
+
+
+def test_pin_store_persistence_across_restart(tmp_path):
+    pin_file = tmp_path / "pins.txt"
+    store1 = FilePinStore(pin_file)
+    service_key = KeyPair.generate()
+    app1 = "wrn:access:client/app-1"
+    app2 = "wrn:access:client/app-2"
+    client1 = KeyPair.generate()
+
+    frame1, _ = _e2e_call(client1, service_key.public_raw, {"text": "x"},
+                          fields=_fields(client_id=app1),
+                          token=ISSUER.token(act=app1))
+
+    # Instance 1 runs with pin store, receives end-to-end call from app1
+    _, replies1 = run(_one_exchange([frame1],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store": store1}))
+    assert replies1[0]["type"] == "result"
+    assert app1 in store1
+
+    # Instance 2 starts with same pin store (reloaded from disk)
+    store2 = FilePinStore(pin_file)
+    plain_app1 = _call(payload={"text": "x"}, request_id="r-plain-app1",
+                       token=ISSUER.token(act=app1))
+    plain_app2 = _call(payload={"text": "x"}, request_id="r-plain-app2",
+                       token=ISSUER.token(act=app2))
+
+    _, replies2 = run(_one_exchange([plain_app1, plain_app2],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store": store2}))
+    # app1 was seen in e2e mode before restart -> not_allowed
+    assert replies2[0]["code"] == "not_allowed"
+    # app2 was never seen in e2e mode -> success (regression)
+    assert replies2[1]["type"] == "result"
+
+
+def test_pin_store_file_via_config_persists_across_restart(tmp_path):
+    pin_file = tmp_path / "pins.txt"
+    service_key = KeyPair.generate()
+    app1 = "wrn:access:client/app-1"
+    client1 = KeyPair.generate()
+
+    frame1, _ = _e2e_call(client1, service_key.public_raw, {"text": "x"},
+                          fields=_fields(client_id=app1),
+                          token=ISSUER.token(act=app1))
+
+    # Instance 1 with pin_store_file configured
+    _, replies1 = run(_one_exchange([frame1],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store_file": pin_file}))
+    assert replies1[0]["type"] == "result"
+
+    # Instance 2 with same pin_store_file configured
+    plain_app1 = _call(payload={"text": "x"}, request_id="r-plain-app1",
+                       token=ISSUER.token(act=app1))
+    _, replies2 = run(_one_exchange([plain_app1],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store_file": pin_file}))
+    assert replies2[0]["code"] == "not_allowed"
+
+
+def test_pin_store_unpinning_allows_subsequent_plaintext_call(tmp_path):
+    pin_file = tmp_path / "pins.txt"
+    store = FilePinStore(pin_file)
+    service_key = KeyPair.generate()
+    app1 = "wrn:access:client/app-1"
+    client1 = KeyPair.generate()
+
+    frame1, _ = _e2e_call(client1, service_key.public_raw, {"text": "x"},
+                          fields=_fields(client_id=app1),
+                          token=ISSUER.token(act=app1))
+
+    _, replies1 = run(_one_exchange([frame1],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store": store}))
+    assert replies1[0]["type"] == "result"
+    assert app1 in store
+
+    # Unpin app1 (e.g. user toggled encryption mode back to none in gateway)
+    store.remove(app1)
+    assert app1 not in store
+
+    # Instance 2 starts with the updated store: app1 can call in none mode
+    store2 = FilePinStore(pin_file)
+    plain_app1 = _call(payload={"text": "x"}, request_id="r-plain-app1",
+                       token=ISSUER.token(act=app1))
+    _, replies2 = run(_one_exchange([plain_app1],
+                                    service_kwargs={"key": service_key,
+                                                    "pin_store": store2}))
+    assert replies2[0]["type"] == "result"
+
+
+def test_default_stateless_behavior_pin_lost_on_restart():
+    service_key = KeyPair.generate()
+    app1 = "wrn:access:client/app-1"
+    client1 = KeyPair.generate()
+
+    frame1, _ = _e2e_call(client1, service_key.public_raw, {"text": "x"},
+                          fields=_fields(client_id=app1),
+                          token=ISSUER.token(act=app1))
+    plain_app1 = _call(payload={"text": "x"}, request_id="r-plain-app1",
+                       token=ISSUER.token(act=app1))
+
+    # Instance 1: e2e call pins app1 in-memory; immediate plaintext is refused
+    _, replies1 = run(_one_exchange([frame1, plain_app1],
+                                    service_kwargs={"key": service_key}))
+    assert replies1[0]["type"] == "result"
+    assert replies1[1]["code"] == "not_allowed"
+
+    # Instance 2 (restart with default stateless behavior): in-memory pin is gone
+    plain_app1_restart = _call(payload={"text": "x"}, request_id="r-plain-restart",
+                               token=ISSUER.token(act=app1))
+    _, replies2 = run(_one_exchange([plain_app1_restart],
+                                    service_kwargs={"key": service_key}))
+    assert replies2[0]["type"] == "result"
 
 
 # --- unusable client key and seal fallback (Issue #9) -----------------------------------
