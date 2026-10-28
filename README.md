@@ -89,11 +89,13 @@ A gateway that predates them ignores the two fields and the announcement.
 
 `Caller` is built from the call's **verified** GW-3 caller token and from
 nothing else (INT-C3): `principal` (the token's `sub`) and `app` (its `act`)
-are always non-blank strings, because a call whose token fails any check
-never reaches the handler. Authorize on `caller.principal` (and, where it
-matters, `caller.app`). `caller.token` is the raw verified JWT, short-lived
-(at most 60 s) and valid for this service only; forward it only where
-something downstream must check it itself, and never log it.
+are always non-blank strings with no leading or trailing whitespace and no
+Unicode `Cc` (control) or `Cf` (format) characters, never normalized (no
+`strip()`, case folding, or NFC/NFKC), because a call whose token fails any
+check never reaches the handler. Authorize on `caller.principal` (and, where
+it matters, `caller.app`). `caller.token` is the raw verified JWT,
+short-lived (at most 60 s) and valid for this service only; forward it only
+where something downstream must check it itself, and never log it.
 
 ## Configuration
 
@@ -126,7 +128,7 @@ and `jwks_fetch(url) -> dict` to replace the HTTP fetch (tests).
 |---|---|
 | Register | Sends `{type: register, contract_version: 2, service, credential, public_key, accepts_caller: true, tools, resources}`, exactly the fields `gateway/contract.py` requires (v2 has no `roles` / `roles_version`), plus `instructions` and `prompts` only when the service declares them. The declaration is validated locally with the gateway's rules first, so a mistake fails at start. `registered` / `rejected {reason}` handled. |
 | Ping | Every `ping` is answered `pong`. |
-| Caller token (GW-3, INT-C3) | Checked on every `call` and `read_resource` **before anything else**: compact JWS with header `alg: EdDSA` and a `kid`; the `kid` is in the gateway key set; the Ed25519 signature verifies; `sub`, `act`, `aud`, `exp`, `jti` present, with `sub`, `act`, `jti` non-blank strings; `aud` is a string equal to `SERVICE_NAME` (a list is refused); `exp` not passed (10 s skew) and no more than 60 s (+ skew) ahead; `jti` not already accepted while the token could be valid (in-memory). Any failure is answered `not_allowed` with the text `caller token refused` and logged once at WARNING with the failed check (never the token); the handler never runs. When the key set cannot be fetched at all the answer is `unavailable` (the token was not checked; a retry may succeed). |
+| Caller token (GW-3, INT-C3) | Checked on every `call` and `read_resource` **before anything else**: compact JWS with header `alg: EdDSA` and a valid `kid`; the `kid` is in the gateway key set; the Ed25519 signature verifies; `sub`, `act`, `aud`, `exp`, `jti` present, with `sub`, `act`, `jti` (and header `kid`) non-blank strings containing no leading or trailing whitespace (`str.isspace()`) and no Unicode `Cc` (control) or `Cf` (format) characters, never normalized; `aud` is a string equal to `SERVICE_NAME` (a list is refused); `exp` not passed (10 s skew) and no more than 60 s (+ skew) ahead; `jti` not already accepted while the token could be valid (in-memory). Any failure is answered `not_allowed` with the text `caller token refused` and logged once at WARNING with the failed check (never the token); the handler never runs. When the key set cannot be fetched at all the answer is `unavailable` (the token was not checked; a retry may succeed). |
 | Key set | `GET` of the JWKS on first use, cached; an unknown `kid` triggers one refetch (the gateway rotated its key), at most one fetch per 10 s however many tokens arrive, and concurrent checks share one fetch. Refreshed after 1 h; a failed refresh keeps the cached keys. Only Ed25519 (`kty OKP`, `crv Ed25519`) keys are used. |
 | Call / read | `on_call(tool, arguments, caller)` / `on_read(uri, caller)`; the reply is `result` or `error` with `request_id`, `encryption`, `payload`. The request id and the verified `principal` / `app` are logged. Frame fields other than the token (a v1 `caller` object, say) never affect who is calling. |
 | Errors (6.3) | `ServiceError(code, message)` sends that code. Unknown tool or resource: `not_found`. Any other exception: `internal` with the text `internal error` (the exception text is never sent or logged). |

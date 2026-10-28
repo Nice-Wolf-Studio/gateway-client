@@ -4,6 +4,9 @@ kid, bounded refetch rate)."""
 
 from __future__ import annotations
 
+import unicodedata
+import uuid
+
 import pytest
 from helpers import APP, PRINCIPAL, Issuer, run
 
@@ -126,12 +129,94 @@ def test_missing_claim_refused(claim):
     assert err.code == "not_allowed"
 
 
-@pytest.mark.parametrize("claim,value", [("sub", ""), ("act", "  "), ("jti", 7),
-                                         ("sub", ["x"])])
+@pytest.mark.parametrize("claim,value", [
+    ("sub", ""), ("sub", " \t "), ("act", "  "), ("act", 7), ("act", ["x"]),
+    ("jti", ""), ("jti", "\n\t"), ("jti", 7), ("sub", ["x"]),
+])
 def test_blank_or_non_string_identity_claim_refused(claim, value):
     issuer = Issuer()
     err = _refused(_verifier(Fetcher(issuer)), issuer.token(now=NOW, **{claim: value}))
     assert err.code == "not_allowed"
+    assert "non-empty" not in err.reason
+    if isinstance(value, str) or claim == "act":
+        assert f"caller_token {claim}" in err.reason and "non-blank" in err.reason
+
+
+@pytest.mark.parametrize("bad_kid", ["", " ", " \t ", "\u00a0", "\u3000"])
+def test_blank_header_kid_refused_before_key_set_fetch(bad_kid):
+    issuer = Issuer()
+    issuer.kid = bad_kid
+    fetch = Fetcher(issuer)
+    err = _refused(_verifier(fetch), issuer.token(now=NOW, kid=bad_kid))
+    assert err.code == "not_allowed"
+    assert "caller_token header kid" in err.reason and "non-blank" in err.reason
+    assert fetch.count == 0
+
+
+BAD_IDENTITY_STRINGS = (
+    # Unicode category Cc (control)
+    "\x00", "u\x1fu", "u\x7f", "\x85u", "u\ru", "u\tu", "u\nu",
+    # Unicode category Cf (format / zero-width / bidi override)
+    "\u200b", "u\u200du", "\ufeffu", "u\u202eu",
+    # Leading or trailing str.isspace()
+    " u", "u ", "\tu", "u\n", "u\r", "\u00a0u", "u\u3000",
+)
+
+
+@pytest.mark.parametrize("field", ["sub", "act", "jti", "kid"])
+@pytest.mark.parametrize("bad", BAD_IDENTITY_STRINGS)
+def test_control_format_or_edge_whitespace_identity_refused(field, bad):
+    issuer = Issuer()
+    if field == "kid":
+        issuer.kid = bad
+    fetch = Fetcher(issuer)
+    err = _refused(_verifier(fetch), issuer.token(now=NOW, **{field: bad}))
+    assert err.code == "not_allowed"
+    assert "non-empty" not in err.reason
+    assert ("control or format" in err.reason
+            or "leading or trailing whitespace" in err.reason)
+    if field == "kid":
+        assert "caller_token header kid" in err.reason
+        assert fetch.count == 0
+    else:
+        assert f"caller_token {field}" in err.reason
+
+
+def test_identity_refusal_reason_never_contains_claim_value():
+    issuer = Issuer()
+    verifier = _verifier(Fetcher(issuer))
+    for field, secret in [("sub", "SECRET-SUB\u200b"),
+                          ("act", "  SECRET-ACT  "),
+                          ("jti", "SECRET-JTI\x00"),
+                          ("kid", "SECRET-KID ")]:
+        err = _refused(verifier, issuer.token(now=NOW, **{field: secret}))
+        assert secret.strip().rstrip("\u200b\x00") not in err.reason
+
+
+VALID_IDENTITY_STRINGS = (
+    "wrn:access:user/user-1",
+    str(uuid.UUID("7f9a0b1c-0000-4000-8000-000000000001")),
+    "u s",
+    "use\u0301r",
+    "用户",
+)
+
+
+@pytest.mark.parametrize("valid", VALID_IDENTITY_STRINGS)
+def test_valid_identity_strings_preserved_byte_identical_without_normalization(valid):
+    issuer = Issuer()
+    issuer.kid = valid
+    verified = run(_verifier(Fetcher(issuer)).verify(
+        issuer.token(now=NOW, sub=valid, act=valid, jti=valid, kid=valid)))
+    assert verified.principal == valid
+    assert verified.app == valid
+    assert verified.claims["jti"] == valid
+    assert verified.principal.encode("utf-8") == valid.encode("utf-8")
+    assert verified.app.encode("utf-8") == valid.encode("utf-8")
+    assert verified.claims["jti"].encode("utf-8") == valid.encode("utf-8")
+    if valid == "use\u0301r":
+        assert unicodedata.is_normalized("NFD", verified.principal)
+        assert not unicodedata.is_normalized("NFC", verified.principal)
 
 
 def test_replayed_jti_refused():
