@@ -37,14 +37,16 @@ import subprocess
 import sys
 import time
 
+CLIENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATEWAY_DIR = os.path.abspath(os.environ.get("MCP_GATEWAY_DIR") or os.getcwd())
+sys.path.insert(0, CLIENT_DIR)
 sys.path.insert(0, GATEWAY_DIR)
 os.chdir(GATEWAY_DIR)
 os.environ.setdefault("WN_WOLF_ACCESS_URL", "http://wolf-access.test")
 TEST_DATABASE_URL = os.environ["TEST_DATABASE_URL"]
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
-SERVICE = "gwc-e2e"
+SERVICE = "gwc_e2e"
 TOOL = {"name": "whoami", "description": "gateway-client e2e: who is calling.",
         "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}},
                         "additionalProperties": False}}
@@ -142,12 +144,18 @@ async def main() -> int:
     logging.basicConfig(level=logging.WARNING)
     (service_row, owner, plain, sealed, plain_token, sealed_token,
      client_key) = await asyncio.to_thread(_seed)
-    from gateway.wrn import PLATFORM_WRN
+    from gateway.access import use_resource
+    from gateway.wrn import is_service_name
+    grant_resource = use_resource(owner)
+    check("service name is valid in wolf-access", is_service_name(SERVICE), SERVICE)
+    check("grant targets the user's personal container",
+          isinstance(grant_resource, str) and grant_resource.startswith("wrn:access:personal/"),
+          str(grant_resource))
     port, stub_port = _free_port(), _free_port()
     base = f"http://127.0.0.1:{port}"
     stub = await _spawn("wolf_access_stub.py", "--port", str(stub_port), env={
         "STUB_PRINCIPALS": json.dumps({owner: "active"}),
-        "STUB_GRANTS": json.dumps([[owner, f"{SERVICE}.use", PLATFORM_WRN]]),
+        "STUB_GRANTS": json.dumps([[owner, f"{SERVICE}.use", grant_resource]]),
         "STUB_GATEWAY_JWKS_URL": f"{base}/.well-known/jwks.json"})
     gateway = await _spawn("-m", "gateway", env={
         "PORT": str(port), "HOST": "127.0.0.1", "DATABASE_URL": TEST_DATABASE_URL,
