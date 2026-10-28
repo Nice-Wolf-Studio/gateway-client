@@ -9,7 +9,7 @@ Status markers used on every rule below:
   "superseded by the v2 cutover" cites the code or gateway rule that differs.
 - **[proposed]**: a recommendation nobody has ruled on. Not a commitment.
 
-Anchors are against **`development` at `23e25d0`** (tags `v0.2.0` and `v0.2.1`; service contract
+Anchors are against **`development` at `23e25d0`** (tag `v0.2.0`; service contract
 version 2). `development` was created from `main` at that commit; `main` is the GitHub default
 branch. Which of the two PRs target is not stated in this repo's files (Q6). The library code at
 `23e25d0` is the code of `197f3b8`; `RELEASE.md` describes the `v0.1.1` -> `197f3b8` changes. Line
@@ -148,7 +148,7 @@ lost on restart. The nonce loss is bounded by the 5-minute `sent_at` limit (`e2e
 
 ### 2.6 Distribution and CI
 
-- Installed from git by tag: `gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.2.0` [as-built] (`README.md:11`). Nothing deploys; each service pins a tag. Tags `v0.2.0` and `v0.2.1` both point at `23e25d0`, whose package version is `0.2.0` (`pyproject.toml:7`, `__init__.py:24`).
+- Installed from git by tag: `gateway-client @ git+https://github.com/Nice-Wolf-Studio/gateway-client@v0.2.0` [as-built] (`README.md:11`). Nothing deploys; each service pins a tag. Tag `v0.2.0` points at `23e25d0`, whose package version is `0.2.0` (`pyproject.toml:7`, `__init__.py:24`).
 - CI: one `pytest` job in a Python 3.10 / 3.12 matrix on every push and PR, so the checks report as `pytest (3.10)` and `pytest (3.12)` [as-built] (`.github/workflows/ci.yml:1-17`). No workflow creates or gates a tag. The tests run against an in-process WebSocket server on 127.0.0.1 with an in-process token issuer (`README.md:140-142`). `tests/test_gateway_e2e.py` runs the library against the real gateway and is skipped unless `MCP_GATEWAY_DIR` and `TEST_DATABASE_URL` are set, so CI does not run it (`README.md:144-156`).
 - Classic branch protection is still absent on `main` and `development` (GitHub API `branches/<branch>/protection` answers 404 at time of writing). Repository rulesets `platform-main` and `platform-development` (created 2026-10-24, active) cover them: no deletion, no force-push, changes through a PR with no approving review required, and required checks `pytest (3.10)` and `pytest (3.12)` on an up-to-date branch (GitHub API `rulesets/25791452`, `rulesets/25794050`). Issue [#4](https://github.com/Nice-Wolf-Studio/gateway-client/issues/4) is still open.
 
