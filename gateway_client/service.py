@@ -137,6 +137,17 @@ def _close_code(exc: ConnectionClosed) -> int | None:
     return exc.rcvd.code if exc.rcvd is not None else None
 
 
+def _safe_str(val: Any) -> str:
+    """Format `val` for log lines, escaping CR and LF to prevent log forging."""
+    if val is None:
+        return "None"
+    s = val if isinstance(val, str) else str(val)
+    return s.replace("\r", "\\r").replace("\n", "\\n")
+
+
+_escape_crlf = _safe_str
+
+
 class GatewayService:
     """One service's connection to the gateway.
 
@@ -260,10 +271,10 @@ class GatewayService:
                 last_problem = attempt.reason
                 if attempt.outcome is _Outcome.REJECTED:
                     log.error("registration rejected: %s; retrying with backoff up to "
-                              "300 s", attempt.reason)
+                              "300 s", _safe_str(attempt.reason))
                 else:
                     log.warning("gateway connection problem: %s; retrying with backoff "
-                                "up to 30 s", attempt.reason)
+                                "up to 30 s", _safe_str(attempt.reason))
             delay = self._backoff.next_delay(rejected=attempt.outcome is _Outcome.REJECTED)
             await self._sleep(delay)
         await self._drain()
@@ -508,16 +519,16 @@ class GatewayService:
             raise
         except Exception as exc:
             log.error("request_id=%s: could not build the reply (%s); answering plain "
-                      "error %s", request_id, type(exc).__name__, INTERNAL)
+                      "error %s", _safe_str(request_id), type(exc).__name__, INTERNAL)
             reply = {"type": "error", "request_id": request_id,
                      "encryption": frame.get("encryption"), "code": INTERNAL,
                      "payload": "internal error"}
         try:
             await self._send(ws, reply)
         except ConnectionClosed:
-            log.warning("request_id=%s: reply not sent, the connection closed", request_id)
+            log.warning("request_id=%s: reply not sent, the connection closed", _safe_str(request_id))
         except Exception as exc:
-            log.error("request_id=%s: reply not sent (%s)", request_id, type(exc).__name__)
+            log.error("request_id=%s: reply not sent (%s)", _safe_str(request_id), type(exc).__name__)
 
     def _check_target(self, is_call: bool, target: Any) -> dict[str, Any]:
         """The declared tool or resource, else ServiceError(not_found)."""
@@ -596,8 +607,11 @@ class GatewayService:
         try:
             return await self._verifier.verify(frame.get("caller_token"))
         except TokenRefused as exc:
-            log.warning("%s request_id=%s refused: %s; answering %s", frame.get("type"),
-                        frame.get("request_id"), exc.reason, exc.code)
+            log.warning("%s request_id=%s refused: %s; answering %s",
+                        _safe_str(frame.get("type")),
+                        _safe_str(frame.get("request_id")),
+                        _safe_str(exc.reason),
+                        exc.code)
             raise ServiceError(exc.code, TOKEN_UNCHECKED if exc.code == UNAVAILABLE
                                else TOKEN_REFUSED) from None
 
@@ -614,16 +628,22 @@ class GatewayService:
         encryption = frame.get("encryption")
         is_call = frame.get("type") == "call"
         target = frame.get("tool") if is_call else frame.get("uri")
-        log.info("%s request_id=%s %s=%s encryption=%s", frame.get("type"), request_id,
-                 "tool" if is_call else "uri", target, encryption)
+        log.info("%s request_id=%s %s=%s encryption=%s",
+                 _safe_str(frame.get("type")),
+                 _safe_str(request_id),
+                 "tool" if is_call else "uri",
+                 _safe_str(target),
+                 _safe_str(encryption))
         client_key: bytes | None = None
         fields: dict[str, Any] | None = None
         try:
             verified = await self._verify_caller(frame)
             caller = Caller.from_token(verified, encryption=encryption,
                                        request_id=request_id)
-            log.info("request_id=%s caller principal=%s app=%s", request_id,
-                     caller.principal, caller.app)
+            log.info("request_id=%s caller principal=%s app=%s",
+                     _safe_str(request_id),
+                     _safe_str(caller.principal),
+                     _safe_str(caller.app))
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
@@ -650,14 +670,14 @@ class GatewayService:
             code, message = exc.code, str(exc)
         except Exception as exc:  # the service's own failure: never leak its text
             log.warning("request_id=%s: handler raised %s; answering internal",
-                        request_id, type(exc).__name__)
+                        _safe_str(request_id), type(exc).__name__)
             code, message = INTERNAL, "internal error"
         else:
             # Sealing happens outside the try: a seal failure is not the
             # handler's, and _reply_frame answers it itself.
             return self._reply_frame("result", request_id, encryption, payload,
                                      client_key, fields)
-        log.info("request_id=%s answered error %s", request_id, code)
+        log.info("request_id=%s answered error %s", _safe_str(request_id), code)
         return self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
 
@@ -679,7 +699,7 @@ class GatewayService:
                 if ftype != "error" or code is None:
                     ftype, code, payload = "error", INTERNAL, "internal error"
                 log.warning("request_id=%s: could not seal the reply (%s); answering "
-                            "plain error %s", request_id, type(exc).__name__, code)
+                            "plain error %s", _safe_str(request_id), type(exc).__name__, code)
         reply: dict[str, Any] = {"type": ftype, "request_id": request_id,
                                  "encryption": encryption}
         if code is not None:

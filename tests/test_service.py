@@ -1254,3 +1254,211 @@ def test_padded_or_format_char_act_cannot_bypass_e2e_pin(caplog):
     warnings = [r for r in caplog.records
                 if r.name.startswith("gateway_client") and r.levelno == logging.WARNING]
     assert len(warnings) == len(bypass_variants)
+
+
+# --- CRLF log escaping (INT-C2 / Issue #6) -------------------------------------------
+
+def test_safe_str_escapes_crlf_and_preserves_clean_values():
+    from gateway_client.service import _escape_crlf, _safe_str
+
+    assert _safe_str is _escape_crlf
+    assert _safe_str(None) == "None"
+    assert _safe_str(42) == "42"
+    assert _safe_str("clean_string") == "clean_string"
+    assert _safe_str("line1\r\nline2\nline3\rline4") == "line1\\r\\nline2\\nline3\\rline4"
+    assert "\r" not in _safe_str("a\rb")
+    assert "\n" not in _safe_str("a\nb")
+
+
+def test_crlf_in_frame_fields_and_tokens_escaped_in_logs(caplog):
+    async def on_call(tool, arguments, caller):
+        return "call-ok"
+
+    async def on_read(uri, caller):
+        return "read-ok"
+
+    # Frame 1: Contract v2 `call` with \r and \n in request_id, tool, and encryption
+    call_crlf = {
+        "type": "call",
+        "request_id": "req\r\ncall\n1",
+        "contract_version": 2,
+        "caller_token": ISSUER.token(jti="jti-crlf-call-1"),
+        "service": "svc",
+        "tool": "echo\r\ntool\n1",
+        "encryption": "none\r\n1",
+        "payload": {},
+    }
+
+    # Frame 2: Contract v2 `read_resource` with \r and \n in request_id, uri, and encryption
+    read_crlf = {
+        "type": "read_resource",
+        "request_id": "req\r\nread\r2",
+        "contract_version": 2,
+        "caller_token": ISSUER.token(jti="jti-crlf-read-2"),
+        "service": "svc",
+        "uri": "svc://status\r\nuri\n2",
+        "encryption": "none\n2",
+    }
+
+    # Frame 3: Unauthenticated / bad-token frame with \r and \n in request_id
+    unauthenticated_bad_token = {
+        "type": "call",
+        "request_id": "req\r\nbad\ntok3",
+        "contract_version": 2,
+        "caller_token": "not-a-valid-token\r\n",
+        "service": "svc",
+        "tool": "echo",
+        "encryption": "none",
+        "payload": {},
+    }
+
+    # Frame 4: Frame whose token claims contain \r and \n (refused by token verifier under #7)
+    bad_claims_frame = {
+        "type": "call",
+        "request_id": "req\r\nbadclaims4",
+        "contract_version": 2,
+        "caller_token": ISSUER.token(sub="sub\r\ninjection", act="act\n\rinjection", jti="jti-crlf-claims-4"),
+        "service": "svc",
+        "tool": "echo",
+        "encryption": "none",
+        "payload": {},
+    }
+
+    # Frame 5: Valid call where request_id has \r and \n, verifying identity logging
+    valid_call = _call(
+        payload={"text": "hello"},
+        request_id="req\r\nvalid5",
+        token=ISSUER.token(jti="jti-crlf-valid-5"),
+    )
+
+    # Frame 6: Valid read where request_id has \r and \n, verifying identity logging
+    valid_read = _read(
+        request_id="req\r\nvalidread6",
+        token=ISSUER.token(jti="jti-crlf-valid-read-6"),
+    )
+
+    # Unauthenticated frame where type and request_id contain \r and \n (tested directly on service)
+    unauthenticated_bad_type = {
+        "type": "call\r\nforged\nType",
+        "request_id": "req\r\nbad\ntok_type",
+        "contract_version": 2,
+        "caller_token": "not-a-valid-token\r\n",
+        "service": "svc",
+        "tool": "echo",
+        "encryption": "none",
+        "payload": {},
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange(
+            [call_crlf, read_crlf, unauthenticated_bad_token, bad_claims_frame, valid_call, valid_read],
+            service_kwargs={"on_call": on_call, "on_read": on_read}))
+        svc = make_service("ws://localhost:9999", issuer=ISSUER)
+        run(svc._reply(unauthenticated_bad_type))
+
+    client_records = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    assert len(client_records) > 0
+
+    for r in client_records:
+        msg = r.getMessage()
+        assert "\r" not in msg, f"Found raw carriage return in log record: {msg!r}"
+        assert "\n" not in msg, f"Found raw newline in log record: {msg!r}"
+
+    # Confirm values are identifiable and escaped
+    log_text = "\n".join(r.getMessage() for r in client_records)
+    assert "req\\r\\ncall\\n1" in log_text
+    assert "echo\\r\\ntool\\n1" in log_text
+    assert "none\\r\\n1" in log_text
+    assert "req\\r\\nread\\r2" in log_text
+    assert "svc://status\\r\\nuri\\n2" in log_text
+    assert "none\\n2" in log_text
+    assert "call\\r\\nforged\\nType" in log_text
+    assert "req\\r\\nbad\\ntok3" in log_text
+    assert "req\\r\\nbad\\ntok_type" in log_text
+    assert "req\\r\\nbadclaims4" in log_text
+    assert "req\\r\\nvalid5" in log_text
+    assert "req\\r\\nvalidread6" in log_text
+    # Request id and verified caller identity are still logged
+    assert PRINCIPAL in log_text
+    assert APP in log_text
+
+
+def test_caller_identity_with_crlf_escaped_in_logs(caplog):
+    from unittest.mock import AsyncMock
+    from gateway_client.caller_token import VerifiedToken
+
+    service = make_service("ws://localhost:9999", issuer=ISSUER)
+    # Simulate a verified token whose claims contain CRLF (defense in depth)
+    mock_verifier = AsyncMock()
+    mock_verifier.verify.return_value = VerifiedToken(
+        principal="wrn:user\r\ninjected",
+        app="wrn:app\n\rinjected",
+        token="mock-token",
+        claims={"aud": "svc", "sub": "wrn:user\r\ninjected", "act": "wrn:app\n\rinjected"},
+    )
+    service._verifier = mock_verifier
+
+    frame = _call(payload={"text": "hi"}, request_id="req\r\nclaims-test")
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        run(service._reply(frame))
+
+    client_records = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    for r in client_records:
+        msg = r.getMessage()
+        assert "\r" not in msg, f"Found raw CR in log: {msg!r}"
+        assert "\n" not in msg, f"Found raw LF in log: {msg!r}"
+
+    log_text = "\n".join(r.getMessage() for r in client_records)
+    assert "wrn:user\\r\\ninjected" in log_text
+    assert "wrn:app\\n\\rinjected" in log_text
+
+
+def test_registration_rejected_crlf_reason_escaped(caplog):
+    async def main():
+        loop = asyncio.get_running_loop()
+        enough = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "bad_cred\r\nFORGED_LINE\r"})
+            await ws.close(1008)
+
+        async def sleep(delay):
+            if not enough.done():
+                enough.set_result(None)
+            await asyncio.sleep(0)
+
+        async with fake_gateway(handler) as url:
+            service = make_service(url, sleep=sleep, rand=lambda: 1.0)
+            await serve_until(service, enough)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        run(main())
+
+    client_records = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    rejection_records = [r for r in client_records if "registration rejected" in r.getMessage()]
+    assert len(rejection_records) == 1
+    for r in client_records:
+        msg = r.getMessage()
+        assert "\r" not in msg, f"Found raw CR in log: {msg!r}"
+        assert "\n" not in msg, f"Found raw LF in log: {msg!r}"
+    assert "bad_cred\\r\\nFORGED_LINE\\r" in rejection_records[0].getMessage()
+
+
+def test_handler_raised_crlf_request_id_escaped(caplog):
+    async def on_call(tool, arguments, caller):
+        raise RuntimeError("boom")
+
+    frame = _call(payload={"text": "x"}, request_id="r\r\nraise\n1")
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call}))
+
+    assert replies[0]["code"] == "internal"
+    client_records = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    for r in client_records:
+        assert "\r" not in r.getMessage()
+        assert "\n" not in r.getMessage()
+    log_text = "\n".join(r.getMessage() for r in client_records)
+    assert "r\\r\\nraise\\n1" in log_text
+    assert "handler raised RuntimeError" in log_text
+
