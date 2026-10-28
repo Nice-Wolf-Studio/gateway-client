@@ -1,6 +1,6 @@
-# Release Notes: `gateway-client` v0.3.0 (`v0.2.1` → `v0.3.0`)
+# Release Notes: `gateway-client` v0.3.0 (`v0.2.0` → `v0.3.0`)
 
-`gateway-client` `0.3.0` (`v0.3.0:pyproject.toml:7`, `v0.3.0:gateway_client/__init__.py:24`) lets a service teach the model through the gateway: optional server **instructions** and optional MCP **prompts** in its declaration. It is **additive** to service contract version 2 (`CONTRACT_VERSION = 2` is unchanged): a service that passes neither sends exactly the `register` frame of `0.2.x` (`v0.3.0:gateway_client/protocol.py:195-198`, `v0.3.0:tests/test_prompts.py:36-38`), and a gateway that predates the fields ignores them. It also ships the tool `annotations` support merged after `v0.2.1`. No new dependencies.
+`gateway-client` `0.3.0` (`v0.3.0:pyproject.toml:7`, `v0.3.0:gateway_client/__init__.py:24`) lets a service teach the model through the gateway: optional server **instructions** and optional MCP **prompts** in its declaration. It is **additive** to service contract version 2 (`CONTRACT_VERSION = 2` is unchanged): a service that passes neither sends exactly the `register` frame of `0.2.x` (`v0.3.0:gateway_client/protocol.py:195-198`, `v0.3.0:tests/test_prompts.py:36-38`), and a gateway that predates the fields ignores them. It also ships the tool `annotations` support merged after `v0.2.0`. No new dependencies.
 
 ---
 
@@ -23,7 +23,7 @@
 - **Wire**: `register` carries `"prompts": [...]` only when non-empty (`v0.3.0:gateway_client/protocol.py:197-198`). After an accepted `update` that changed the prompts the library sends `{"type": "prompts_changed"}` (`v0.3.0:gateway_client/service.py:311`, `:339-340`); the gateway relays it as `notifications/prompts/list_changed` to the sessions allowed to use the service.
 - **Constructing with prompts needs the service name** (to check the prefix): `Declaration.build(..., prompts=[...])` without `service=` raises `ValueError` (`v0.3.0:gateway_client/protocol.py:157-158`); `GatewayService` always passes `SERVICE_NAME` (`v0.3.0:gateway_client/service.py:186-188`).
 
-## 3. Tool annotations (since `v0.2.1`)
+## 3. Tool annotations (since `v0.2.0`)
 
 - A tool may carry MCP `annotations`; `Declaration.build` refuses a non-object value and a non-boolean `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` with `ValueError`, matching the gateway's `malformed_tool` (`v0.3.0:gateway_client/protocol.py:33-43`). Other keys pass through unchanged.
 

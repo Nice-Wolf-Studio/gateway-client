@@ -1,7 +1,7 @@
 # gateway-client: acceptance criteria
 
 Each criterion can fail. "Fake gateway" means the in-process WebSocket server the tests use
-(`tests/helpers.py`). Anchors are against `development` at `23e25d0` (tags `v0.2.0` and `v0.2.1`;
+(`tests/helpers.py`). Anchors are against `development` at `23e25d0` (tag `v0.2.0`;
 service contract version 2). AC 24 keeps its v0.1.1 history (anchored at `b4b05a2`) and states
 the v0.2.0 criterion. AC 1-20 and AC 24 are as-built behavior; AC 21-23 check decided rules that
 apply to this library, and AC 21-22 carry a "superseded by the v2 cutover" note where contract v2
