@@ -370,7 +370,7 @@ def test_bad_caller_token_refused_before_the_handler(bad, kind):
     _, replies = run(_one_exchange([frame], service_kwargs=_refusing_handlers(called)))
     assert replies == [{"type": "error", "request_id": frame["request_id"],
                         "encryption": "none", "code": "not_allowed",
-                        "payload": "caller token refused"}]
+                        "payload": TOKEN_REFUSED}]
     assert called == []
 
 
@@ -383,7 +383,8 @@ def test_frame_without_a_caller_token_refused(variant):
     else:
         frame["caller_token"] = None if variant == "null" else 42
     _, replies = run(_one_exchange([frame], service_kwargs=_refusing_handlers(called)))
-    assert replies[0]["code"] == "not_allowed" and called == []
+    assert (replies[0]["code"] == "not_allowed" and
+            replies[0]["payload"] == TOKEN_REFUSED and called == [])
 
 
 def test_replayed_jti_refused_before_the_handler():
@@ -562,7 +563,7 @@ def test_e2e_token_refusal_is_plain_not_allowed():
     _, replies = run(_one_exchange([frame], service_kwargs={
         "key": service_key, **_refusing_handlers(called)}))
     assert replies[0] == {"type": "error", "request_id": "r-e2e", "encryption": "end-to-end",
-                          "code": "not_allowed", "payload": "caller token refused"}
+                          "code": "not_allowed", "payload": TOKEN_REFUSED}
     assert called == []
 
 
@@ -990,6 +991,100 @@ def test_e2e_missing_target_unit_reply_direct(caplog):
     assert rep_read["encryption"] == "end-to-end"
     assert calls_invoked == [] and reads_invoked == []
     assert "handler raised" not in caplog.text
+
+
+# --- check precedence ------------------------------------------------------------------
+
+@pytest.mark.parametrize("token_case", [
+    "missing",
+    "invalid",
+])
+@pytest.mark.parametrize("subsequent_case", [
+    "undeclared_tool",
+    "undeclared_resource",
+    "unknown_encryption",
+    "mismatched_client_kid",
+])
+def test_caller_token_precedes_subsequent_checks(token_case, subsequent_case):
+    """Caller token verification runs before encryption mode, client key, and
+    target checks: frames with missing or invalid caller tokens answer not_allowed
+    with TOKEN_REFUSED rather than failing on subsequent checks."""
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    other = KeyPair.generate()
+    called = []
+
+    frame: dict[str, Any] = {
+        "type": "call",
+        "request_id": f"r-{token_case}-{subsequent_case}",
+        "contract_version": 2,
+        "service": "svc",
+        "tool": "echo",
+        "encryption": "none",
+        "payload": {"text": "hello"},
+    }
+
+    if token_case == "invalid":
+        frame["caller_token"] = ISSUER.token(aud="other-service")
+    # if "missing", we do not include "caller_token" in frame
+
+    if subsequent_case == "undeclared_tool":
+        frame["tool"] = "undeclared_tool"
+    elif subsequent_case == "undeclared_resource":
+        frame["type"] = "read_resource"
+        frame["uri"] = "svc://undeclared"
+        del frame["tool"]
+        del frame["payload"]
+    elif subsequent_case == "unknown_encryption":
+        frame["encryption"] = "foo"
+    elif subsequent_case == "mismatched_client_kid":
+        frame["encryption"] = "end-to-end"
+        frame["client_public_key"] = client.public_b64
+        frame["client_kid"] = other.kid
+
+    _, replies = run(_one_exchange([frame], service_kwargs={
+        "key": service_key, **_refusing_handlers(called)}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "error"
+    assert reply["request_id"] == frame["request_id"]
+    assert reply["code"] == "not_allowed"
+    assert reply["payload"] == TOKEN_REFUSED
+    assert called == []
+
+
+def test_e2e_client_key_precedes_target_check_with_valid_token():
+    """An end-to-end request with a valid caller_token, an undeclared tool name,
+    and a mismatched client_kid answers bad_arguments rather than not_found
+    (precedence: _client_key precedes _check_target)."""
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    other = KeyPair.generate()
+    called = []
+
+    frame = {
+        "type": "call",
+        "request_id": "r-client-key-precedence",
+        "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP),
+        "service": "svc",
+        "tool": "undeclared_tool",
+        "encryption": "end-to-end",
+        "client_public_key": client.public_b64,
+        "client_kid": other.kid,  # mismatched kid
+        "payload": {},
+    }
+
+    _, replies = run(_one_exchange([frame], service_kwargs={
+        "key": service_key, **_refusing_handlers(called)}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "error"
+    assert reply["request_id"] == "r-client-key-precedence"
+    assert reply["encryption"] == "end-to-end"
+    assert reply["code"] == "bad_arguments"
+    assert reply["payload"] == "client_kid does not match client_public_key"
+    assert called == []
 
 
 # --- re-register and announcements ------------------------------------------------------
