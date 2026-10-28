@@ -81,7 +81,10 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
    The gateway serves the prompts itself, filling the placeholders; there is no prompt handler.
 2. `service.run_forever()` or `await service.run()` [as-built] (`service.py:227-256`).
 3. Callbacks may be sync (run in a worker thread) or async [as-built] (`service.py:114-122`).
-   A tool result may be content blocks, a string, or any JSON value [as-built] (`protocol.py:94-101`).
+   A tool result may be content blocks, a string, any JSON value, a `ToolResult(content=..., is_error=True)`,
+   or a dict with `"isError": True` [as-built] (`protocol.py:204-250`). When `is_error` is True, the `result`
+   frame carries `is_error: True` (authenticated in HPKE associated data in `end-to-end` mode), yielding
+   `CallToolResult(isError=True)` to the MCP client without a gateway wire error code (`_meta.gateway.code`).
 
 ### 2.3 Registration handshake (contract v2, auth)
 
@@ -119,6 +122,7 @@ identity reaches a backend no other way [as-built, gateway] (`mcp-gateway:gatewa
 | `none` mode | Refused `not_allowed` if the connected app (`act`) was seen in end-to-end mode by **this process**. The local refusal of a `none` call to a `requires_end_to_end` role was removed in v0.2.0; which tools need end-to-end is wolf-access's decision, enforced by the gateway. | `service.py:484-491`, `583`, `594`; `CHANGELOG.md:49-52`; `README.md:95` |
 | `end-to-end` mode | Check `client_kid` matches `client_public_key`; build the associated data from the verified token (`user_id` = `sub`, `client_id` = `act`, `service` = `aud`, `contract_version: 2`); open the envelope (kid must name the client's key; tampered/undecryptable or bound to other ids → `bad_arguments`; `sent_at` > 5 min off or nonce reused by that app within 10 min → `not_allowed`); validate arguments against `inputSchema`; seal the reply (or error text) to the client key. A token refusal is sent unsealed. | `service.py:523-535`, `575-592`, `609-624`; `e2e.py:191-211`, `285-316` |
 | Handler error | `ServiceError(code, msg)` sends that code; any other exception sends `internal` with text `internal error`, exception text never sent or logged. | `service.py:599-607` |
+| Tool error (`isError`) | Returning `ToolResult(content=..., is_error=True)` or a dict `{"isError": True, "content": ...}` sends a `result` frame with `is_error: True` (in `end-to-end` mode, cryptographically authenticated in the HPKE AAD via `reply_header(..., is_error=True)`). Yields `CallToolResult(isError=True)` to the caller without `_meta.gateway.code`. Traced with `outcome="tool_error"`. | `protocol.py:204-250`, `service.py:766-770`, `e2e.py:220-224` |
 | Legacy calls | Removed in v0.2.0: a legacy call carries no caller token, so it could never be served. | `CHANGELOG.md:53-56` |
 
 **Known gap: resolved in v0.1.1, superseded in v0.2.0** [as-built, `development` `23e25d0`]. At

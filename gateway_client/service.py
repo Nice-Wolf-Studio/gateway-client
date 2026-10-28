@@ -58,7 +58,7 @@ from .logs import (
     current_request_id,
     request_scope,
 )
-from .protocol import Backoff, Declaration, content_blocks, resource_contents
+from .protocol import Backoff, Declaration, ToolResult, content_blocks, parse_tool_result, resource_contents
 
 log = logging.getLogger("gateway_client")
 # The WebSocket library logs every frame at DEBUG, and frames carry the
@@ -195,7 +195,7 @@ class _CallLog:
             "duration_ms": duration_ms,
             "outcome": outcome,
         }
-        if outcome != "result":
+        if outcome not in ("result", "tool_error"):
             fields["error_code"] = outcome
         level = (
             logging.INFO
@@ -621,16 +621,17 @@ class GatewayService:
                                             "plaintext call is refused")
 
     async def _run_handler(self, is_call: bool, target: str, declared: dict[str, Any],
-                           arguments: Any, caller: Caller) -> list[Any]:
+                           arguments: Any, caller: Caller) -> tuple[list[Any], bool]:
         if is_call:
             if arguments is None:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ServiceError(BAD_ARGUMENTS, "arguments must be a JSON object")
-            return content_blocks(await _invoke(self._on_call, target, arguments, caller))
+            raw = await _invoke(self._on_call, target, arguments, caller)
+            return parse_tool_result(raw)
         assert self._on_read is not None
         value = await _invoke(self._on_read, target, caller)
-        return resource_contents(value, target, declared.get("mimeType") or "text/plain")
+        return resource_contents(value, target, declared.get("mimeType") or "text/plain"), False
 
     @staticmethod
     def _check_schema(declared: dict[str, Any], arguments: Any) -> None:
@@ -753,7 +754,7 @@ class GatewayService:
             else:
                 self._check_plaintext_allowed(caller.app)
                 arguments = frame.get("payload")
-            payload = await self._run_handler(is_call, target, declared, arguments, caller)
+            payload, is_error = await self._run_handler(is_call, target, declared, arguments, caller)
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
         except Exception as exc:  # the service's own failure: never leak its text
@@ -764,13 +765,17 @@ class GatewayService:
             # Sealing happens outside the try: a seal failure is not the
             # handler's, and _reply_frame answers it itself.
             reply = self._reply_frame("result", request_id, encryption, payload,
-                                      client_key, fields)
-            outcome = "result" if reply["type"] == "result" else reply.get("code", INTERNAL)
+                                      client_key, fields, is_error=is_error)
+            outcome = (
+                ("tool_error" if is_error else "result")
+                if reply["type"] == "result"
+                else reply.get("code", INTERNAL)
+            )
             call_log.end(outcome)
             return reply
 
         reply = self._reply_frame("error", request_id, encryption, message, client_key,
-                                 fields, code=code)
+                                  fields, code=code)
         outcome = reply.get("code", code)
         log.info("request_id=%s answered error %s", _safe_str(request_id), outcome)
         call_log.end(outcome)
@@ -778,8 +783,8 @@ class GatewayService:
 
     def _reply_frame(self, ftype: str, request_id: Any, encryption: Any, payload: Any,
                      client_key: bytes | None, fields: dict[str, Any] | None,
-                     code: str | None = None) -> dict[str, Any]:
-        """`{type, request_id, encryption, [code,] payload}`; in `end-to-end`
+                     code: str | None = None, is_error: bool = False) -> dict[str, Any]:
+        """`{type, request_id, encryption, [code,] [is_error,] payload}`; in `end-to-end`
         the payload is sealed to the client when the client's key and the
         verified caller are known (else plain, which the gateway turns into
         `internal`). Should sealing fail anyway, the reply is a plain
@@ -787,17 +792,21 @@ class GatewayService:
         result (a result is never sent unsealed)."""
         if encryption == e2e.ENCRYPTION_E2E and client_key is not None and fields is not None:
             try:
+                reply_fields = e2e.reply_header(fields, str(request_id), is_error=is_error)
                 payload = e2e.seal(payload, sender=self.config.key,
                                    recipient_public_raw=client_key,
-                                   fields=e2e.reply_header(fields, str(request_id)))
+                                   fields=reply_fields)
             except Exception as exc:
                 if ftype != "error" or code is None:
                     ftype, code, payload = "error", INTERNAL, "internal error"
+                    is_error = False
                 log.warning("request_id=%s: could not seal the reply (%s); answering "
                             "plain error %s", _safe_str(request_id), type(exc).__name__, code)
         reply: dict[str, Any] = {"type": ftype, "request_id": request_id,
                                  "encryption": encryption}
         if code is not None:
             reply["code"] = code
+        if is_error and ftype == "result":
+            reply["is_error"] = True
         reply["payload"] = payload
         return reply

@@ -201,14 +201,61 @@ class Declaration:
 
 # --- reply shaping ----------------------------------------------------------------
 
+class ToolResult:
+    """A tool execution's result: MCP content blocks (or raw value) and an
+    optional `is_error` flag (default False)."""
+
+    def __init__(self, content: Any = None, *, is_error: bool = False,
+                 isError: bool | None = None) -> None:
+        self.content = content if content is not None else []
+        self.is_error = bool(isError if isError is not None else is_error)
+
+    @property
+    def isError(self) -> bool:
+        return self.is_error
+
+    def __repr__(self) -> str:
+        return f"ToolResult(content={self.content!r}, is_error={self.is_error!r})"
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, ToolResult):
+            return self.content == other.content and self.is_error == other.is_error
+        return False
+
+
 def content_blocks(value: Any) -> list[Any]:
     """A handler's tool result as MCP content blocks: a list is kept, a
-    string becomes one text block, anything else one text block of its JSON."""
+    string becomes one text block, anything else one text block of its JSON.
+    If given a ToolResult or a dict with isError/is_error and content,
+    extracts the inner content."""
+    if isinstance(value, ToolResult):
+        return content_blocks(value.content)
+    if isinstance(value, dict) and ("isError" in value or "is_error" in value) and "content" in value:
+        return content_blocks(value["content"])
     if isinstance(value, list):
         return value
     if isinstance(value, str):
         return [{"type": "text", "text": value}]
     return [{"type": "text", "text": json.dumps(value, default=str)}]
+
+
+def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
+    """Parse a handler's tool return value into (content_blocks, is_error).
+
+    Accepts:
+    - ToolResult instance
+    - dict with "isError" or "is_error"
+    - list of content blocks
+    - string
+    - any JSON-serializable value
+    """
+    if isinstance(value, ToolResult):
+        return content_blocks(value.content), value.is_error
+    if isinstance(value, dict) and ("isError" in value or "is_error" in value):
+        is_error = bool(value.get("isError") if "isError" in value else value.get("is_error"))
+        raw = value["content"] if "content" in value else value
+        return content_blocks(raw), is_error
+    return content_blocks(value), False
 
 
 def resource_contents(value: Any, uri: str, mime_type: str) -> list[Any]:
