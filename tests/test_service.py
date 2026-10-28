@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import unicodedata
+import uuid
 
 import pytest
 from helpers import (
@@ -24,6 +26,7 @@ from helpers import (
 
 from gateway_client import Caller, KeyPair, ServiceError, e2e
 from gateway_client.protocol import Backoff
+from gateway_client.service import TOKEN_REFUSED
 
 ISSUER = Issuer()   # the gateway's signing key in these tests
 
@@ -677,3 +680,125 @@ def test_update_reregisters_then_announces_tools_changed():
 def test_announce_when_not_registered_returns_false():
     service = make_service("ws://127.0.0.1:1/backend")
     assert run(service.send_tools_changed()) is False
+
+
+# --- caller identity string validation (#7) ---------------------------------------------
+
+BAD_CALLER_IDENTITY_VALUES = (
+    # Unicode category Cc (control)
+    "\x00", "u\x1fu", "u\x7f", "\x85u", "u\ru",
+    # Unicode category Cf (format)
+    "\u200b", "u\u200du", "\ufeffu", "u\u202eu",
+    # Leading / trailing str.isspace()
+    " u", "u ", "\tu", "u\n", "\u00a0u", "u\u3000",
+    # Blank / empty
+    "", " \t ",
+)
+
+VALID_CALLER_IDENTITY_VALUES = (
+    "wrn:access:user/user-1",
+    str(uuid.UUID("7f9a0b1c-0000-4000-8000-000000000001")),
+    "u s",
+    "use\u0301r",
+    "用户",
+)
+
+
+@pytest.mark.parametrize("kind", ["call", "read_resource"])
+@pytest.mark.parametrize("field", ["sub", "act", "jti", "kid"])
+@pytest.mark.parametrize("bad_value", BAD_CALLER_IDENTITY_VALUES)
+def test_control_format_or_edge_whitespace_claim_or_kid_refused_and_logged_once(
+    kind, field, bad_value, caplog
+):
+    called = []
+    issuer = Issuer()
+    if field == "kid":
+        issuer.kid = bad_value
+    token = issuer.token(**{field: bad_value})
+    req_id = "r-bad-id"
+    frame = (_call(payload={"text": "x"}, request_id=req_id, token=token) if kind == "call"
+             else _read(request_id=req_id, token=token))
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={
+            "issuer": issuer, **_refusing_handlers(called)}))
+    assert replies == [{"type": "error", "request_id": req_id,
+                        "encryption": "none", "code": "not_allowed",
+                        "payload": TOKEN_REFUSED}]
+    assert called == []
+    ours = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    warnings = [r for r in ours if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert req_id in warnings[0].getMessage()
+    assert "non-empty" not in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("valid_id", VALID_CALLER_IDENTITY_VALUES)
+def test_valid_identity_claims_reach_handlers_byte_identical(valid_id):
+    seen_call = []
+    seen_read = []
+
+    async def on_call(tool, arguments, caller):
+        seen_call.append(caller)
+        return "ok"
+
+    async def on_read(uri, caller):
+        seen_read.append(caller)
+        return "status-ok"
+
+    tok_call = ISSUER.token(sub=valid_id, act=valid_id, jti=valid_id)
+    tok_read = ISSUER.token(sub=valid_id, act=valid_id)
+    _, replies = run(_one_exchange(
+        [_call(payload={"text": "hi"}, request_id="r-c", token=tok_call),
+         _read(request_id="r-r", token=tok_read)],
+        service_kwargs={"on_call": on_call, "on_read": on_read}))
+    assert [r["type"] for r in replies] == ["result", "result"]
+    assert len(seen_call) == 1 and len(seen_read) == 1
+    for caller in (seen_call[0], seen_read[0]):
+        assert caller.principal == valid_id
+        assert caller.app == valid_id
+        assert caller.principal.encode("utf-8") == valid_id.encode("utf-8")
+        assert caller.app.encode("utf-8") == valid_id.encode("utf-8")
+        if valid_id == "use\u0301r":
+            assert unicodedata.is_normalized("NFD", caller.principal)
+            assert not unicodedata.is_normalized("NFC", caller.principal)
+    assert seen_call[0].claims["jti"] == valid_id
+    assert seen_call[0].claims["jti"].encode("utf-8") == valid_id.encode("utf-8")
+
+
+def test_padded_or_format_char_act_cannot_bypass_e2e_pin(caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    pinned_app = "wrn:gateway:client/c1"
+    invoked = []
+
+    async def on_call(tool, arguments, caller):
+        invoked.append(caller.app)
+        return "sealed"
+
+    e2e_frame, _ = _e2e_call(
+        client, service_key.public_raw, {"text": "x"},
+        request_id="r-pin",
+        fields=_fields(client_id=pinned_app),
+        token=ISSUER.token(act=pinned_app))
+    bypass_variants = [
+        ("r-trail-space", "wrn:gateway:client/c1 "),
+        ("r-lead-space", " wrn:gateway:client/c1"),
+        ("r-zwsp", "wrn:gateway:client/c1\u200b"),
+        ("r-nul", "wrn:gateway:client/c1\x00"),
+    ]
+    plain_frames = [
+        _call(payload={"text": "x"}, request_id=req_id, token=ISSUER.token(act=bad_act))
+        for req_id, bad_act in bypass_variants
+    ]
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([e2e_frame, *plain_frames],
+                                       service_kwargs={"on_call": on_call,
+                                                       "key": service_key}))
+    assert replies[0]["type"] == "result"
+    assert invoked == [pinned_app]
+    for (req_id, _), reply in zip(bypass_variants, replies[1:]):
+        assert reply == {"type": "error", "request_id": req_id,
+                         "encryption": "none", "code": "not_allowed",
+                         "payload": TOKEN_REFUSED}
+    warnings = [r for r in caplog.records
+                if r.name.startswith("gateway_client") and r.levelno == logging.WARNING]
+    assert len(warnings) == len(bypass_variants)

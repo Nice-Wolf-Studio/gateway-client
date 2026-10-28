@@ -12,14 +12,17 @@ For every routed call the gateway sends a `caller_token`: a JWT signed EdDSA
 `CallerTokenVerifier.verify` checks, in order, and raises `TokenRefused` on
 the first failure:
 
-1. the token is a compact JWS whose header names `alg: EdDSA` and a `kid`;
+1. the token is a compact JWS whose header names `alg: EdDSA` and a valid
+   `kid` (a non-blank string with no leading or trailing whitespace and no
+   Unicode `Cc` control or `Cf` format characters);
 2. `kid` is a key in the key set (`KeySet`; an unknown kid triggers one
    rate-limited refetch, for a gateway that rotated its key);
 3. the signature verifies under that key;
 4. `sub`, `act`, `aud`, `exp` and `jti` are present; `sub`, `act` and `jti`
-   are non-blank strings; `aud` is a string equal to this service's name (a
-   list is refused even when it names the service: the token is for one
-   backend);
+   are non-blank strings with no leading or trailing whitespace and no
+   Unicode `Cc` (control) or `Cf` (format) characters, kept as-is without
+   normalization; `aud` is a string equal to this service's name (a list is
+   refused even when it names the service: the token is for one backend);
 5. `exp` has not passed, allowing `leeway` seconds of clock skew, and is no
    more than 60 s plus `leeway` ahead (GW-3's maximum lifetime);
 6. `jti` has not been accepted before while the token could still be valid
@@ -46,6 +49,7 @@ import asyncio
 import inspect
 import json
 import time
+import unicodedata
 import urllib.request
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -214,6 +218,25 @@ class KeySet:
         raise TokenRefused("kid is not in the gateway key set")
 
 
+_FORBIDDEN_CATEGORIES = frozenset(("Cc", "Cf"))
+
+
+def _check_id_str(label: str, value: Any) -> str:
+    """Validate a caller-identity or key-id string (`sub`, `act`, `jti`,
+    header `kid`): a non-blank `str` with no leading or trailing whitespace
+    and no Unicode control (`Cc`) or format (`Cf`) characters. Never
+    normalizes; returns `value` unchanged or raises `TokenRefused`."""
+    if not isinstance(value, str) or not value:
+        raise TokenRefused(f"{label} is not a non-blank string")
+    if value[0].isspace() or value[-1].isspace():
+        if not value.strip():
+            raise TokenRefused(f"{label} is not a non-blank string")
+        raise TokenRefused(f"{label} has leading or trailing whitespace")
+    if any(unicodedata.category(ch) in _FORBIDDEN_CATEGORIES for ch in value):
+        raise TokenRefused(f"{label} contains a control or format character")
+    return value
+
+
 class CallerTokenVerifier:
     """Checks GW-3 caller tokens for one service (module docstring)."""
 
@@ -253,8 +276,9 @@ class CallerTokenVerifier:
         if header.get("alg") != ALGORITHM:
             raise TokenRefused("caller_token is not signed EdDSA")
         kid = header.get("kid")
-        if not isinstance(kid, str) or not kid:
+        if kid is None:
             raise TokenRefused("caller_token header has no kid")
+        kid = _check_id_str("caller_token header kid", kid)
         key = await self.key_set.key(kid)
         claims = self._decode(token, key, now)
         self._check_claims(claims, now)
@@ -285,9 +309,7 @@ class CallerTokenVerifier:
         if claims.get("aud") != self.audience:
             raise TokenRefused("caller_token audience is not this service")
         for name in ("sub", "act", "jti"):
-            value = claims.get(name)
-            if not isinstance(value, str) or not value.strip():
-                raise TokenRefused(f"caller_token {name} is not a non-empty string")
+            _check_id_str(f"caller_token {name}", claims.get(name))
         exp = claims.get("exp")
         if isinstance(exp, bool) or not isinstance(exp, (int, float)):
             raise TokenRefused("caller_token exp is not a number")

@@ -69,7 +69,9 @@ class Caller:
     """Who is calling, from the call's verified GW-3 caller token and
     nothing else. A call or read reaches the handler only after its token
     passed every check (signature, audience, expiry, required claims, no
-    replay), so `principal` and `app` are always non-blank strings.
+    replay), so `principal` and `app` are always non-blank strings with no
+    leading or trailing whitespace and no Unicode `Cc` (control) or `Cf`
+    (format) characters, passed through unchanged without normalization.
 
     - `principal`: the principal WRN the call acts as (the token's `sub`):
       a user, or the agent the app acts for.
