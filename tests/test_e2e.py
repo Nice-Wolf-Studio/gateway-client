@@ -147,3 +147,20 @@ def test_keypair_round_trip_and_repr_hides_private():
     again = KeyPair.from_private_b64(pair.private_b64())
     assert again.public_raw == pair.public_raw
     assert pair.private_b64() not in repr(pair)
+
+
+@pytest.mark.parametrize("bad_key", [
+    b"\x00" * 32,                 # all-zero key
+    b"\x01" + b"\x00" * 31,       # order 2 point
+    b"\x00" * 16,                 # invalid length
+    "not-bytes",                  # invalid type
+])
+def test_check_public_key_refuses_small_order_and_invalid(bad_key):
+    with pytest.raises(ValueError, match="public key is a small-order X25519 point"):
+        e2e.check_public_key(bad_key)
+
+
+def test_check_public_key_accepts_valid():
+    pair = KeyPair.generate()
+    # Does not raise
+    e2e.check_public_key(pair.public_raw)

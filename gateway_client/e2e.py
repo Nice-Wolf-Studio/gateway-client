@@ -137,6 +137,18 @@ def decode_public_key(text: Any, field: str = "public_key") -> bytes:
     return raw
 
 
+def check_public_key(raw: bytes) -> None:
+    """ValueError unless `raw` is an X25519 public key HPKE can use: one for
+    which the Diffie-Hellman shared secret is not all zeros. That refuses
+    the all-zero key and every other small-order point (and their
+    non-canonical encodings), which every private key maps to the zero
+    secret, so a throwaway private key decides it for all of them."""
+    try:
+        X25519PrivateKey.generate().exchange(X25519PublicKey.from_public_bytes(raw))
+    except (ValueError, TypeError):
+        raise ValueError("public key is a small-order X25519 point") from None
+
+
 # --- keys ------------------------------------------------------------------------
 
 @dataclass(frozen=True)

@@ -635,6 +635,208 @@ def test_none_call_after_e2e_from_same_app_refused():
     assert replies[2]["type"] == "result"
 
 
+# --- unusable client key and seal fallback (Issue #9) -----------------------------------
+
+@pytest.mark.parametrize("path,frame_factory", [
+    ("unknown_tool", lambda pub, kid: {
+        "type": "call", "request_id": "r-zero-a", "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP), "service": "svc",
+        "tool": "nonexistent_tool", "encryption": "end-to-end",
+        "client_public_key": pub, "client_kid": kid, "payload": {},
+    }),
+    ("declared_tool", lambda pub, kid: {
+        "type": "call", "request_id": "r-zero-b", "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP), "service": "svc",
+        "tool": "echo", "encryption": "end-to-end",
+        "client_public_key": pub, "client_kid": kid, "payload": {},
+    }),
+    ("read_resource", lambda pub, kid: {
+        "type": "read_resource", "request_id": "r-zero-c", "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP), "service": "svc",
+        "uri": "svc://status", "encryption": "end-to-end",
+        "client_public_key": pub, "client_kid": kid,
+    }),
+])
+@pytest.mark.parametrize("bad_key", [
+    b"\x00" * 32,             # all zeros
+    b"\x01" + b"\x00" * 31,   # order 2 point
+])
+def test_unusable_client_key_refused_plain_bad_arguments_and_app_not_pinned(
+        path, frame_factory, bad_key, caplog):
+    service_key = KeyPair.generate()
+    pub_b64 = e2e.b64url_encode(bad_key)
+    kid = e2e.key_id(bad_key)
+    frame = frame_factory(pub_b64, kid)
+    req_id = frame["request_id"]
+
+    calls_invoked, reads_invoked = [], []
+    async def on_call(tool, arguments, caller):
+        calls_invoked.append(tool)
+        return [{"type": "text", "text": "ok"}]
+
+    async def on_read(uri, caller):
+        reads_invoked.append(uri)
+        return "status ok"
+
+    followup = _call(tool="echo", payload={"text": "plain-allowed"},
+                     request_id=f"{req_id}-followup", encryption="none",
+                     token=ISSUER.token(act=APP))
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame, followup],
+                                       service_kwargs={"key": service_key,
+                                                       "on_call": on_call,
+                                                       "on_read": on_read}))
+
+    assert len(replies) == 2
+    reply, followup_reply = replies[0], replies[1]
+
+    # Plain unsealed error bad_arguments
+    assert reply == {
+        "type": "error", "request_id": req_id, "encryption": "end-to-end",
+        "code": "bad_arguments",
+        "payload": "client_public_key cannot be used for end-to-end encryption",
+    }
+    # Handlers were never invoked for the bad frame
+    assert reads_invoked == []
+    assert calls_invoked == (["echo"] if followup_reply["type"] == "result" else [])
+
+    # App was not pinned: follow-up plaintext call from the same app succeeds
+    assert followup_reply["type"] == "result"
+    assert followup_reply["payload"] == [{"type": "text", "text": "ok"}]
+
+    # Log assertions:
+    # 1. No "handler raised" logged
+    assert "handler raised" not in caplog.text
+    # 2. No unhandled exception
+    assert "Task exception was never retrieved" not in caplog.text
+    # 3. Logged error code matches the code actually sent
+    client_logs = [r for r in caplog.records if r.name.startswith("gateway_client")]
+    for record in client_logs:
+        msg = record.getMessage()
+        if f"request_id={req_id}" in msg and "error" in msg:
+            assert "bad_arguments" in msg
+            assert "internal" not in msg
+
+
+@pytest.mark.parametrize("bad_token", [None, "invalid.caller.token"])
+def test_unusable_client_key_with_missing_or_invalid_token_is_not_allowed(bad_token, caplog):
+    service_key = KeyPair.generate()
+    zero_key = b"\x00" * 32
+    pub_b64 = e2e.b64url_encode(zero_key)
+    kid = e2e.key_id(zero_key)
+    frame = {
+        "type": "call", "request_id": "r-zero-d", "contract_version": 2,
+        "caller_token": bad_token, "service": "svc",
+        "tool": "echo", "encryption": "end-to-end",
+        "client_public_key": pub_b64, "client_kid": kid, "payload": {},
+    }
+    followup = _call(tool="echo", payload={"text": "plain-allowed"},
+                     request_id="r-zero-d-followup", encryption="none",
+                     token=ISSUER.token(act=APP))
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame, followup],
+                                       service_kwargs={"key": service_key}))
+
+    assert len(replies) == 2
+    assert replies[0] == {
+        "type": "error", "request_id": "r-zero-d", "encryption": "end-to-end",
+        "code": "not_allowed", "payload": TOKEN_REFUSED,
+    }
+    assert replies[1]["type"] == "result"
+    assert "handler raised" not in caplog.text
+    assert "Task exception was never retrieved" not in caplog.text
+
+
+def test_seal_failure_fallback_on_result_answers_plain_internal(monkeypatch, caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    frame, fields = _e2e_call(client, service_key.public_raw, {"text": "hello"},
+                             request_id="r-seal-fail")
+
+    def broken_seal(*args, **kwargs):
+        raise ValueError("broken crypto hardware")
+
+    monkeypatch.setattr(e2e, "seal", broken_seal)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key}))
+
+    assert len(replies) == 1
+    assert replies[0] == {
+        "type": "error", "request_id": "r-seal-fail", "encryption": "end-to-end",
+        "code": "internal", "payload": "internal error",
+    }
+    assert "handler raised" not in caplog.text
+    assert any("could not seal the reply (ValueError); answering plain error internal" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_seal_failure_fallback_on_error_preserves_error_code(monkeypatch, caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    frame, fields = _e2e_call(client, service_key.public_raw, {"text": "hello"},
+                             tool="undeclared_tool", request_id="r-seal-err")
+
+    def broken_seal(*args, **kwargs):
+        raise ValueError("broken crypto hardware")
+
+    monkeypatch.setattr(e2e, "seal", broken_seal)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key}))
+
+    assert len(replies) == 1
+    assert replies[0] == {
+        "type": "error", "request_id": "r-seal-err", "encryption": "end-to-end",
+        "code": "not_found", "payload": "unknown tool: undeclared_tool",
+    }
+    assert "handler raised" not in caplog.text
+    assert any("could not seal the reply (ValueError); answering plain error not_found" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_answer_catches_unexpected_reply_failure_and_sends_plain_internal(caplog):
+    sent = []
+    class FakeWS:
+        async def send(self, data):
+            import json
+            sent.append(json.loads(data))
+
+    service = make_service("ws://localhost:9999", issuer=ISSUER)
+
+    async def broken_reply(frame):
+        raise RuntimeError("unexpected fatal flaw")
+
+    service._reply = broken_reply
+    frame = {"type": "call", "request_id": "r-fatal", "encryption": "end-to-end"}
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        run(service._answer(FakeWS(), frame))
+
+    assert sent == [{
+        "type": "error", "request_id": "r-fatal", "encryption": "end-to-end",
+        "code": "internal", "payload": "internal error",
+    }]
+    assert any("could not build the reply (RuntimeError); answering plain error internal" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_answer_catches_send_failure_without_raising(caplog):
+    class ExplodingWS:
+        async def send(self, data):
+            raise ConnectionResetError("socket dropped")
+
+    service = make_service("ws://localhost:9999", issuer=ISSUER)
+    frame = {"type": "call", "request_id": "r-send-drop", "encryption": "none"}
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        # Must not raise
+        run(service._answer(ExplodingWS(), frame))
+
+    assert any("reply not sent (ConnectionResetError)" in r.getMessage()
+               for r in caplog.records)
+
+
 # --- re-register and announcements ------------------------------------------------------
 
 def test_update_reregisters_then_announces_tools_changed():
