@@ -28,6 +28,7 @@ import inspect
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable
@@ -36,7 +37,7 @@ import jsonschema
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from . import caller_token, e2e
+from . import caller_token, e2e, logs
 from .caller_token import CallerTokenVerifier, KeySet, TokenRefused, VerifiedToken
 from .config import Config
 from .errors import (
@@ -47,6 +48,15 @@ from .errors import (
     UNAVAILABLE,
     RegistrationRejected,
     ServiceError,
+)
+from .logs import (
+    JsonFormatter,
+    RequestIdFilter,
+    _safe_str,
+    apply_env_format,
+    configure_logging,
+    current_request_id,
+    request_scope,
 )
 from .protocol import Backoff, Declaration, content_blocks, resource_contents
 
@@ -145,15 +155,54 @@ def _close_code(exc: ConnectionClosed) -> int | None:
     return exc.rcvd.code if exc.rcvd is not None else None
 
 
-def _safe_str(val: Any) -> str:
-    """Format `val` for log lines, escaping CR and LF to prevent log forging."""
-    if val is None:
-        return "None"
-    s = val if isinstance(val, str) else str(val)
-    return s.replace("\r", "\\r").replace("\n", "\\n")
-
-
 _escape_crlf = _safe_str
+
+
+class _CallLog:
+    """The `call.start` / `call.end` pair for one verified call or read."""
+
+    def __init__(self, *, request_id: Any, is_call: bool, target: Any,
+                 caller: Caller, encryption: Any, started: float) -> None:
+        self.request_id = request_id
+        self.is_call = is_call
+        self.target = target
+        self.caller = caller
+        self.encryption = encryption
+        self.started = started
+
+    def start(self) -> None:
+        fields: dict[str, Any] = {
+            "event": "call.start",
+            "request_id": self.request_id,
+            "target": self.target,
+            ("tool" if self.is_call else "uri"): self.target,
+            "principal": self.caller.principal,
+            "app": self.caller.app,
+            "encryption": self.encryption,
+        }
+        logs.emit(log, logging.INFO, "call.start", fields)
+
+    def end(self, outcome: str) -> None:
+        duration_ms = round((time.monotonic() - self.started) * 1000.0, 2)
+        fields: dict[str, Any] = {
+            "event": "call.end",
+            "request_id": self.request_id,
+            "target": self.target,
+            ("tool" if self.is_call else "uri"): self.target,
+            "principal": self.caller.principal,
+            "app": self.caller.app,
+            "encryption": self.encryption,
+            "duration_ms": duration_ms,
+            "outcome": outcome,
+        }
+        if outcome != "result":
+            fields["error_code"] = outcome
+        level = (
+            logging.INFO
+            if outcome == "result"
+            else (logging.ERROR if outcome == INTERNAL else logging.WARNING)
+        )
+        logs.emit(log, level, "call.end", fields)
 
 
 class GatewayService:
@@ -273,6 +322,7 @@ class GatewayService:
 
     async def run(self) -> None:
         """Connect, register and serve, reconnecting until `stop()`."""
+        apply_env_format()
         self._stop_event = asyncio.Event()
         self._registered_event = self._registered_event or asyncio.Event()
         last_problem: str | None = None
@@ -646,6 +696,10 @@ class GatewayService:
         sealed to the client; a token refusal is not (there is no verified
         identity to bind the associated data to), so the gateway relays it
         to the client as `internal`."""
+        with request_scope(frame.get("request_id")):
+            return await self._reply_logged(frame)
+
+    async def _reply_logged(self, frame: dict[str, Any]) -> dict[str, Any]:
         request_id = frame.get("request_id")
         encryption = frame.get("encryption")
         is_call = frame.get("type") == "call"
@@ -660,12 +714,24 @@ class GatewayService:
         fields: dict[str, Any] | None = None
         try:
             verified = await self._verify_caller(frame)
-            caller = Caller.from_token(verified, encryption=encryption,
-                                       request_id=request_id)
-            log.info("request_id=%s caller principal=%s app=%s",
-                     _safe_str(request_id),
-                     _safe_str(caller.principal),
-                     _safe_str(caller.app))
+        except ServiceError as exc:
+            log.info("request_id=%s answered error %s", _safe_str(request_id), exc.code)
+            return self._reply_frame("error", request_id, encryption, str(exc),
+                                     client_key, fields, code=exc.code)
+
+        caller = Caller.from_token(verified, encryption=encryption,
+                                   request_id=request_id)
+        call_log = _CallLog(
+            request_id=request_id,
+            is_call=is_call,
+            target=target,
+            caller=caller,
+            encryption=encryption,
+            started=time.monotonic(),
+        )
+        call_log.start()
+
+        try:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
@@ -697,11 +763,18 @@ class GatewayService:
         else:
             # Sealing happens outside the try: a seal failure is not the
             # handler's, and _reply_frame answers it itself.
-            return self._reply_frame("result", request_id, encryption, payload,
-                                     client_key, fields)
-        log.info("request_id=%s answered error %s", _safe_str(request_id), code)
-        return self._reply_frame("error", request_id, encryption, message, client_key,
+            reply = self._reply_frame("result", request_id, encryption, payload,
+                                      client_key, fields)
+            outcome = "result" if reply["type"] == "result" else reply.get("code", INTERNAL)
+            call_log.end(outcome)
+            return reply
+
+        reply = self._reply_frame("error", request_id, encryption, message, client_key,
                                  fields, code=code)
+        outcome = reply.get("code", code)
+        log.info("request_id=%s answered error %s", _safe_str(request_id), outcome)
+        call_log.end(outcome)
+        return reply
 
     def _reply_frame(self, ftype: str, request_id: Any, encryption: Any, payload: Any,
                      client_key: bytes | None, fields: dict[str, Any] | None,

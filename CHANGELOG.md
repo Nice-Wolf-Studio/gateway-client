@@ -3,6 +3,31 @@
 The version follows semantic versioning; before 1.0.0 a breaking change
 raises the minor version.
 
+## [0.4.0] - 2026-10-28
+
+Additive request tracing and structured logging on service contract version 2 (#20).
+
+### Added
+
+- Every routed `call` and `read_resource` emits structured `call.start` and `call.end`
+  log records once the caller is verified:
+  - `call.start`: `request_id`, `target` (`tool` or `uri`), `principal` (`caller.principal`),
+    `app` (`caller.app`), and `encryption`.
+  - `call.end`: `request_id`, `target` (`tool` or `uri`), `principal`, `app`, `encryption`,
+    `duration_ms`, and `outcome` (`"result"` or error code e.g. `"not_found"`, `"bad_arguments"`,
+    `"internal"`).
+- `current_request_id()`: context variable helper (`contextvars.ContextVar`) that returns
+  the active gateway `request_id` inside `on_call` and `on_read` handlers (across `await`
+  boundaries, threads, and concurrent tasks) and `None` outside handlers.
+- `RequestIdFilter`: stamps `record.request_id` on every log record, correlating a service's
+  internal logs with the gateway request lifecycle.
+- Structured JSON log formatting:
+  - `GATEWAY_LOG_FORMAT=json` switches log formatting to single-line JSON with ISO-8601 UTC timestamps.
+  - `JsonFormatter`, `configure_logging()`, and `apply_env_format()` in `gateway_client.logs`
+    and exported from `gateway_client`.
+- Metadata-only logging invariant: arguments, results, error text, `SERVICE_CREDENTIAL`,
+  `SERVICE_PRIVATE_KEY`, and `Caller.token` are strictly never logged (zero heuristic redaction).
+
 ## 0.3.0
 
 Additive to service contract version 2: nothing changes for a service
