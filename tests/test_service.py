@@ -774,8 +774,12 @@ def test_seal_failure_fallback_on_result_answers_plain_internal(monkeypatch, cap
 
 def test_seal_failure_fallback_on_error_preserves_error_code(monkeypatch, caplog):
     client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def on_call(tool, arguments, caller):
+        raise ServiceError("not_found", "unknown tool: undeclared_tool")
+
     frame, fields = _e2e_call(client, service_key.public_raw, {"text": "hello"},
-                             tool="undeclared_tool", request_id="r-seal-err")
+                             tool="echo", request_id="r-seal-err")
 
     def broken_seal(*args, **kwargs):
         raise ValueError("broken crypto hardware")
@@ -783,7 +787,8 @@ def test_seal_failure_fallback_on_error_preserves_error_code(monkeypatch, caplog
     monkeypatch.setattr(e2e, "seal", broken_seal)
 
     with caplog.at_level(logging.DEBUG, logger="gateway_client"):
-        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key}))
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key,
+                                                                "on_call": on_call}))
 
     assert len(replies) == 1
     assert replies[0] == {
@@ -835,6 +840,156 @@ def test_answer_catches_send_failure_without_raising(caplog):
 
     assert any("reply not sent (ConnectionResetError)" in r.getMessage()
                for r in caplog.records)
+
+
+# --- missing target in end-to-end mode (Issue #10) -------------------------------
+
+@pytest.mark.parametrize("kind,bad_target_kwargs", [
+    ("call", {}),                           # omitted tool
+    ("call", {"tool": None}),               # null tool
+    ("call", {"tool": 123}),                # non-string tool
+    ("read_resource", {}),                  # omitted uri
+    ("read_resource", {"uri": None}),       # null uri
+    ("read_resource", {"uri": 123}),        # non-string uri
+])
+def test_e2e_missing_or_non_string_target_answered_not_found(kind, bad_target_kwargs, caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    calls_invoked, reads_invoked = [], []
+
+    async def on_call(tool, arguments, caller):
+        calls_invoked.append(tool)
+        return [{"type": "text", "text": "ok"}]
+
+    async def on_read(uri, caller):
+        reads_invoked.append(uri)
+        return "status ok"
+
+    req_id = f"r-{kind}-missing"
+    frame: dict[str, Any] = {
+        "type": kind,
+        "request_id": req_id,
+        "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP),
+        "service": "svc",
+        "encryption": "end-to-end",
+        "client_public_key": client.public_b64,
+        "client_kid": client.kid,
+    }
+    if kind == "call":
+        frame["payload"] = {}
+    frame.update(bad_target_kwargs)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key,
+                                                                "on_call": on_call,
+                                                                "on_read": on_read}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "error"
+    assert reply["request_id"] == req_id
+    assert reply["encryption"] == "end-to-end"
+    assert reply["code"] == "not_found"
+    assert calls_invoked == []
+    assert reads_invoked == []
+    assert "handler raised" not in caplog.text
+
+
+@pytest.mark.parametrize("kind,bad_target_kwargs", [
+    ("call", {"tool": "undeclared_tool"}),
+    ("call", {}),
+    ("call", {"tool": None}),
+    ("call", {"tool": 123}),
+    ("read_resource", {"uri": "svc://undeclared"}),
+    ("read_resource", {}),
+    ("read_resource", {"uri": None}),
+    ("read_resource", {"uri": 123}),
+])
+def test_e2e_mismatched_client_kid_precedes_missing_or_undeclared_target(
+        kind, bad_target_kwargs, caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    other = KeyPair.generate()
+    calls_invoked, reads_invoked = [], []
+
+    async def on_call(tool, arguments, caller):
+        calls_invoked.append(tool)
+        return [{"type": "text", "text": "ok"}]
+
+    async def on_read(uri, caller):
+        reads_invoked.append(uri)
+        return "status ok"
+
+    req_id = f"r-{kind}-kid-mismatch"
+    frame: dict[str, Any] = {
+        "type": kind,
+        "request_id": req_id,
+        "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP),
+        "service": "svc",
+        "encryption": "end-to-end",
+        "client_public_key": client.public_b64,
+        "client_kid": other.kid,  # mismatched kid
+    }
+    if kind == "call":
+        frame["payload"] = {}
+    frame.update(bad_target_kwargs)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"key": service_key,
+                                                                "on_call": on_call,
+                                                                "on_read": on_read}))
+
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply["type"] == "error"
+    assert reply["request_id"] == req_id
+    assert reply["encryption"] == "end-to-end"
+    assert reply["code"] == "bad_arguments"
+    assert reply["payload"] == "client_kid does not match client_public_key"
+    assert calls_invoked == []
+    assert reads_invoked == []
+    assert "handler raised" not in caplog.text
+
+
+def test_e2e_missing_target_unit_reply_direct(caplog):
+    service_key = KeyPair.generate()
+    client = KeyPair.generate()
+    calls_invoked, reads_invoked = [], []
+
+    async def on_call(tool, arguments, caller):
+        calls_invoked.append(tool)
+        return "ok"
+
+    async def on_read(uri, caller):
+        reads_invoked.append(uri)
+        return "ok"
+
+    service = make_service("ws://localhost:9999", issuer=ISSUER, key=service_key,
+                           on_call=on_call, on_read=on_read)
+
+    call_frame = {
+        "type": "call", "request_id": "r-direct-call", "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP), "service": "svc",
+        "encryption": "end-to-end", "client_public_key": client.public_b64,
+        "client_kid": client.kid,
+    }
+    read_frame = {
+        "type": "read_resource", "request_id": "r-direct-read", "contract_version": 2,
+        "caller_token": ISSUER.token(act=APP), "service": "svc",
+        "encryption": "end-to-end", "client_public_key": client.public_b64,
+        "client_kid": client.kid,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        rep_call = run(service._reply(call_frame))
+        rep_read = run(service._reply(read_frame))
+
+    assert rep_call["type"] == "error" and rep_call["code"] == "not_found"
+    assert rep_call["encryption"] == "end-to-end"
+    assert rep_read["type"] == "error" and rep_read["code"] == "not_found"
+    assert rep_read["encryption"] == "end-to-end"
+    assert calls_invoked == [] and reads_invoked == []
+    assert "handler raised" not in caplog.text
 
 
 # --- re-register and announcements ------------------------------------------------------

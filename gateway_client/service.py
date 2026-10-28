@@ -627,16 +627,14 @@ class GatewayService:
             if encryption not in (e2e.ENCRYPTION_NONE, e2e.ENCRYPTION_E2E):
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
-                # Key and associated data first, so even a refusal is sealed.
-                # The associated data comes from the verified token only.
                 client_key = self._client_key(frame)
+            declared = self._check_target(is_call, target)
+            if encryption == e2e.ENCRYPTION_E2E:
                 fields = e2e.header(
                     user_id=caller.principal, client_id=caller.app,
                     service=verified.claims["aud"], encryption=encryption,
                     **({"tool": target} if is_call else {"uri": target}))
                 self._pinned.add(caller.app)
-            declared = self._check_target(is_call, target)
-            if encryption == e2e.ENCRYPTION_E2E:
                 arguments = None
                 if is_call:
                     arguments = e2e.open_envelope(
