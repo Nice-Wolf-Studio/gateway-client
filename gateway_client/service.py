@@ -31,7 +31,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, MutableSet
 
 import jsonschema
 from websockets.asyncio.client import ClientConnection, connect
@@ -40,6 +40,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from . import caller_token, e2e, logs
 from .caller_token import CallerTokenVerifier, KeySet, TokenRefused, VerifiedToken
 from .config import Config
+from .pins import FilePinStore
 from .errors import (
     BAD_ARGUMENTS,
     INTERNAL,
@@ -240,6 +241,7 @@ class GatewayService:
                  resources: Iterable[dict] = (), on_read: OnRead | None = None,
                  prompts: Iterable[dict] = (), instructions: str | None = None,
                  config: Config | None = None,
+                 pin_store: MutableSet[str] | None = None,
                  max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
                  reply_timeout: float = DEFAULT_REPLY_TIMEOUT,
                  sleep: Callable[[float], Awaitable[Any]] | None = None,
@@ -268,7 +270,12 @@ class GatewayService:
         self._sleep_fn = sleep
         self._backoff = Backoff(rand)
         self._replay = e2e.ReplayGuard()
-        self._pinned: set[str] = set()   # app WRNs seen in end-to-end mode
+        if pin_store is not None:
+            self._pinned: MutableSet[str] = pin_store
+        elif self.config.pin_store_file is not None:
+            self._pinned = FilePinStore(self.config.pin_store_file)
+        else:
+            self._pinned = set()
         self._ws: ClientConnection | None = None     # the registered connection
         self._conn: ClientConnection | None = None   # any open connection
         self._mode: str | None = None
@@ -312,6 +319,11 @@ class GatewayService:
     @property
     def registered(self) -> bool:
         return self._mode is not None
+
+    @property
+    def pinned(self) -> MutableSet[str]:
+        """The store or set of connected app WRNs seen in end-to-end mode."""
+        return self._pinned
 
     def run_forever(self) -> None:
         """Blocking entry point: `asyncio.run(self.run())`, quiet on Ctrl-C."""

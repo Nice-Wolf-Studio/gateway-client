@@ -141,14 +141,15 @@ and logged once at WARNING with its request id and the failed check, never the t
 ### 2.5 Data
 
 The library stores nothing on disk except an optionally created private-key file
-(`config.py:99-113`). In memory: the end-to-end replay nonces per connected app for 10 minutes
+(`config.py:99-113`) and an optional downgrade pin store file (`pins.py:FilePinStore`,
+`config.py:pin_store_file`). In memory: the end-to-end replay nonces per connected app for 10 minutes
 (`e2e.py:84`, `262-283`; `service.py:591`), the set of connected app WRNs seen in end-to-end mode
-(`service.py:190`), the accepted caller-token `jti`s until each token's `exp` plus leeway
-(`caller_token.py:227`, `264`), and the cached gateway key set (`caller_token.py:147-148`). All are
-lost on restart. The nonce loss is bounded by the 5-minute `sent_at` limit (`e2e.py:83`,
-`299-300`); the `jti` loss by the token lifetime of at most 60 s plus leeway
-(`caller_token.py:61-62`, `294-297`); the downgrade pin loss is not bounded. Tracked in
-[#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3); see open question Q2.
+(`service.py:272`), the accepted caller-token `jti`s until each token's `exp` plus leeway
+(`caller_token.py:227`, `264`), and the cached gateway key set (`caller_token.py:147-148`).
+Without an opt-in pin store, all are lost on restart. The nonce loss is bounded by the 5-minute
+`sent_at` limit (`e2e.py:83`, `299-300`); the `jti` loss by the token lifetime of at most 60 s plus
+leeway (`caller_token.py:61-62`, `294-297`); downgrade pin persistence is opt-in via `pin_store`
+or `SERVICE_PIN_STORE_FILE` (see resolved question Q2). Tracked in [#3](https://github.com/Nice-Wolf-Studio/gateway-client/issues/3).
 
 ### 2.6 Distribution and CI
 
@@ -228,7 +229,7 @@ arise here.
 ## 5. Open questions
 
 - **Q1. Resolved by v0.1.1** (`b4b05a2`, #2 closed): a v1 call or read without valid caller ids is refused before the handler runs, with `not_allowed`. Superseded in v0.2.0 by the caller-token check: no frame reaches a handler without a verified `caller_token` (`service.py:537-548`, `568`). Question was: should a v1 call or read with no `caller` (or no `user_id`/`client_id`) be refused before the handler runs, and if so with which error code (`bad_arguments` or `internal`)?
-- **Q2.** Should the end-to-end downgrade pin (connected app WRNs seen in end-to-end mode, `service.py:190`) survive a restart, and if so where is it stored, given the library stores nothing today? Tracked in #3.
+- **Q2. Resolved:** Default behavior: In-memory per-process pinning is the default, maintaining the zero-disk-dependency stateless invariant and avoiding permanent breakage of legitimate user-initiated encryption mode switches in `mcp-gateway` (`PUT /api/v1/clients/{id}/encryption`). Opt-in persistence: `GatewayService` supports an optional `pin_store` parameter (or `SERVICE_PIN_STORE_FILE` path in config) for deployments that require cross-restart persistence. Pin stores support checking `app in store`, adding `store.add(app)`, and optionally unpinning `store.remove(app)` or `clear()`. Tracked in #3.
 - **Q3.** Which of options (a), (b), (c) in 3.3 links this library to the wolf-access client, or something else?
 - **Q4.** Does the caller frame need an acting-agent / sponsor field or a consistency token for wolf-access, and if so is that a contract v2? Contract v2 shipped with a GW-3 token carrying `sub` (the principal: a user, or the agent the app acts for), `act` (the connected app WRN), `aud`, `iat`, `exp`, `jti`, and no sponsor or consistency-token field (`mcp-gateway:gateway/caller_token.py:23-31`; `service.py:73-75`). Whether one is needed is still open.
 - **Q5.** Should the library enforce the decided not-found rule for resources the caller has no role on, or only document it? Under v2 the library holds no roles at all (`protocol.py:30-38`).
