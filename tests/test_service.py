@@ -16,6 +16,7 @@ from helpers import (
     RESOURCES,
     TOOLS,
     Issuer,
+    default_on_call,
     fake_gateway,
     make_service,
     recv_json,
@@ -24,7 +25,7 @@ from helpers import (
     serve_until,
 )
 
-from gateway_client import Caller, KeyPair, ServiceError, e2e
+from gateway_client import Caller, Config, GatewayService, KeyPair, ServiceError, e2e
 from gateway_client.protocol import Backoff
 from gateway_client.service import TOKEN_REFUSED
 
@@ -208,6 +209,194 @@ def test_backoff_resets_after_registration():
 
     run(main())
     assert delays[:5] == [1, 2, 4, 1, 1]
+
+
+def test_backoff_does_not_reset_on_rejection():
+    delays = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        enough = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "auth_failed"})
+            await ws.close(1008)
+
+        async def sleep(delay):
+            delays.append(delay)
+            if len(delays) >= 5 and not enough.done():
+                enough.set_result(None)
+            await asyncio.sleep(0)
+
+        async with fake_gateway(handler) as url:
+            service = make_service(url, sleep=sleep, rand=lambda: 1.0)
+            await serve_until(service, enough)
+
+    run(main())
+    assert delays[:5] == [1, 2, 4, 8, 16]
+
+
+def test_rejected_registration_logs_service_kid_url_and_reason_on_one_line(caplog):
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "key_changed"})
+            await ws.close(1008)
+
+        async with fake_gateway(handler) as url:
+            service = make_service(url)
+
+            async def sleep(_delay):
+                if not done.done():
+                    done.set_result(None)
+                await asyncio.sleep(0)
+
+            service._sleep_fn = sleep
+            await serve_until(service, done)
+            return service, url
+
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        svc, gw_url = run(main())
+
+    rejection_records = [r for r in caplog.records if "registration rejected" in r.getMessage()]
+    assert len(rejection_records) == 1
+    msg = rejection_records[0].getMessage()
+    assert "\n" not in msg
+    assert f"service '{svc.config.service_name}'" in msg
+    assert f"kid '{svc.kid}'" in msg
+    assert f"at {gw_url}" in msg
+    assert "registration rejected: key_changed" in msg
+    assert "retrying with backoff up to 300 s" in msg
+
+
+def test_connection_closed_by_gateway_logs_close_code_and_reason(caplog):
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            # Gateway supersedes: closes socket with code 1000 and reason "superseded"
+            await ws.close(1000, "superseded")
+
+        async with fake_gateway(handler) as url:
+            service = make_service(url)
+
+            async def sleep(_delay):
+                if not done.done():
+                    done.set_result(None)
+                await asyncio.sleep(0)
+
+            service._sleep_fn = sleep
+            await serve_until(service, done)
+            return service
+
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        svc = run(main())
+
+    closed_records = [r for r in caplog.records if "connection to the gateway ended" in r.getMessage()]
+    assert len(closed_records) >= 1
+    msg = closed_records[0].getMessage()
+    assert f"service '{svc.config.service_name}'" in msg
+    assert "code=1000" in msg
+    assert "reason=superseded" in msg
+    assert "\n" not in msg
+
+
+def test_two_services_in_one_process_rejection_logs_name_their_own_service(caplog):
+    async def main():
+        loop = asyncio.get_running_loop()
+        done_alpha = loop.create_future()
+        done_beta = loop.create_future()
+
+        async def handler(ws):
+            frame = await recv_json(ws)
+            svc_name = frame.get("service")
+            await send_json(ws, {"type": "rejected", "reason": f"rejected_{svc_name}"})
+            await ws.close(1008)
+
+        async with fake_gateway(handler) as url:
+            async def sleep_alpha(_delay):
+                if not done_alpha.done():
+                    done_alpha.set_result(None)
+                await asyncio.sleep(0)
+
+            async def sleep_beta(_delay):
+                if not done_beta.done():
+                    done_beta.set_result(None)
+                await asyncio.sleep(0)
+
+            cfg_alpha = Config(url=url, service_name="web_search", credential="cred_alpha",
+                               key=KeyPair.generate())
+            cfg_beta = Config(url=url, service_name="utilities", credential="cred_beta",
+                              key=KeyPair.generate())
+
+            svc_alpha = GatewayService(tools=TOOLS, on_call=default_on_call, config=cfg_alpha,
+                                       sleep=sleep_alpha, reply_timeout=5.0)
+            svc_beta = GatewayService(tools=TOOLS, on_call=default_on_call, config=cfg_beta,
+                                      sleep=sleep_beta, reply_timeout=5.0)
+
+            await asyncio.gather(serve_until(svc_alpha, done_alpha),
+                                 serve_until(svc_beta, done_beta))
+            return svc_alpha, svc_beta
+
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        svc_alpha, svc_beta = run(main())
+
+    rejection_records = [r for r in caplog.records if "registration rejected" in r.getMessage()]
+    assert len(rejection_records) == 2
+    msgs = [r.getMessage() for r in rejection_records]
+
+    alpha_msgs = [m for m in msgs if "service 'web_search'" in m]
+    beta_msgs = [m for m in msgs if "service 'utilities'" in m]
+
+    assert len(alpha_msgs) == 1
+    assert len(beta_msgs) == 1
+    assert f"kid '{svc_alpha.kid}'" in alpha_msgs[0]
+    assert "rejected_web_search" in alpha_msgs[0]
+    assert f"kid '{svc_beta.kid}'" in beta_msgs[0]
+    assert "rejected_utilities" in beta_msgs[0]
+
+
+def test_rejection_and_connection_logs_never_contain_credential_or_private_key(caplog):
+    secret_cred = "SERVICE_CREDENTIAL_TOP_SECRET"
+    key = KeyPair.generate()
+    secret_priv = key.private_b64()
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "bad_credential"})
+            await ws.close(1008)
+
+        async with fake_gateway(handler) as url:
+            cfg = Config(url=url, service_name="secure_svc", credential=secret_cred, key=key)
+
+            async def sleep(_delay):
+                if not done.done():
+                    done.set_result(None)
+                await asyncio.sleep(0)
+
+            svc = GatewayService(tools=TOOLS, on_call=default_on_call, config=cfg,
+                                 sleep=sleep, reply_timeout=5.0)
+            await serve_until(svc, done)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        run(main())
+
+    all_logs = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret_cred not in all_logs
+    assert secret_priv not in all_logs
+    assert "SERVICE_CREDENTIAL" not in all_logs
+    assert "SERVICE_PRIVATE_KEY" not in all_logs
 
 
 # --- ping / calls / errors ---------------------------------------------------------
