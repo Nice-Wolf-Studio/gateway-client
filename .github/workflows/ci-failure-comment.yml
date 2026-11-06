@@ -1,0 +1,67 @@
+# Posts one comment per workflow on a pull request when that workflow fails, with the failed jobs and the
+# last lines of their logs, and edits the same comment (no new ones) on later failures and once it passes.
+# workflow_run runs this file from the default branch with a write token, so it also covers fork PRs.
+name: CI failure comment
+on:
+  workflow_run:
+    workflows: ["*", "!CI failure comment"]
+    types: [completed]
+permissions:
+  actions: read
+  pull-requests: write
+concurrency:
+  group: ci-failure-comment-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.head_sha }}
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      contains(fromJSON('["failure","timed_out","success"]'), github.event.workflow_run.conclusion)
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 5
+    steps:
+      - name: Post or update the PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+          # pull_requests is empty for fork PRs: find the open PR by its head commit instead.
+          if [ -z "$PR" ]; then
+            PR=$(gh pr list -R "$REPO" --state open --limit 200 --json number,headRefOid \
+              --jq ".[] | select(.headRefOid==\"$HEAD_SHA\") | .number" | head -n1)
+          fi
+          [ -n "$PR" ] || { echo "no open PR has head $HEAD_SHA"; exit 0; }
+          marker="<!-- ci-failure-comment:$WORKFLOW_ID -->"
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.user.login==\"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" | tail -n1)
+          short=${HEAD_SHA:0:7}
+          if [ "$CONCLUSION" = success ]; then
+            [ -n "$existing" ] || exit 0   # never failed on this PR: stay quiet
+            body=$(printf '%s\n✅ **%s** passes as of %s ([run](%s)).\n' "$marker" "$RUN_NAME" "$short" "$RUN_URL")
+          else
+            jobs=$(gh run view "$RUN_ID" -R "$REPO" --json jobs \
+              --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | "- [\(.name)](\(.url))"')
+            # "job<TAB>step<TAB>timestamp text" -> "job | text", without colour codes or group markers.
+            log=$(gh run view "$RUN_ID" -R "$REPO" --log-failed 2>/dev/null \
+              | awk -F'\t' '{ t = $3; sub(/^\xef\xbb\xbf/, "", t); sub(/^[0-9T:.-]+Z /, "", t); print $1 " | " t }' \
+              | sed -E 's/(\x1b|\^\[)\[[0-9;]*[A-Za-z]//g' | grep -vE '\| ##\[(group|endgroup)\]' \
+              | tail -n 60 | cut -c1-400 || true)
+            case $CONCLUSION in timed_out) what="timed out" ;; *) what="failed" ;; esac
+            body=$(printf '%s\n❌ **%s** %s on %s ([run](%s)).\n\n%s\n\n<details><summary>Last lines of the failed steps</summary>\n\n~~~~text\n%s\n~~~~\n</details>\n' \
+              "$marker" "$RUN_NAME" "$what" "$short" "$RUN_URL" "${jobs:-- (no job details)}" "${log:-(log not available)}")
+          fi
+          body=${body:0:60000}
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -f body="$body" >/dev/null
+            echo "updated comment $existing on #$PR"
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null
+            echo "commented on #$PR"
+          fi
