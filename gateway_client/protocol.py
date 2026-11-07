@@ -24,6 +24,10 @@ CONTRACT_VERSION = 2
 RETRY_CAP_SECONDS = 30.0      # backoff cap after a dropped connection
 REJECTED_CAP_SECONDS = 300.0  # backoff cap after `rejected`
 BASE_DELAY_SECONDS = 1.0
+# The gateway closes a connection with this code when a newer registration of
+# the same service replaced it (e.g. a deploy running old and new side by
+# side). Reconnecting at once would supersede the new instance back.
+SUPERSEDED_CLOSE_CODE = 4001
 
 
 def _nonempty_str(value: Any) -> bool:
@@ -290,3 +294,9 @@ class Backoff:
         step = min(self._step, cap)
         self._step = min(step * 2, cap)
         return step * (0.5 + self._rand() / 2)
+
+    def superseded_delay(self) -> float:
+        """The wait after the gateway closed a registered connection as
+        superseded (`SUPERSEDED_CLOSE_CODE`): `RETRY_CAP_SECONDS`, with the
+        same jitter. The step is left as is."""
+        return RETRY_CAP_SECONDS * (0.5 + self._rand() / 2)
