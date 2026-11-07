@@ -59,7 +59,7 @@ from .logs import (
     current_request_id,
     request_scope,
 )
-from .protocol import Backoff, Declaration, ToolResult, content_blocks, parse_tool_result, resource_contents
+from .protocol import SUPERSEDED_CLOSE_CODE, Backoff, Declaration, ToolResult, content_blocks, parse_tool_result, resource_contents
 
 log = logging.getLogger("gateway_client")
 # The WebSocket library logs every frame at DEBUG, and frames carry the
@@ -342,6 +342,16 @@ class GatewayService:
             attempt = await self._attempt()
             if self._stop_event.is_set():
                 break
+            superseded = (attempt.outcome is _Outcome.REGISTERED
+                          and attempt.close_code == SUPERSEDED_CLOSE_CODE)
+            if superseded:
+                last_problem = None
+                delay = self._backoff.superseded_delay()
+                log.info("service '%s': superseded by a newer registration of this "
+                         "service (code=%s); reconnecting in %.0f s",
+                         self._service, attempt.close_code, delay)
+                await self._sleep(delay)
+                continue
             if attempt.outcome is _Outcome.REGISTERED:
                 last_problem = None
                 log.info("service '%s': connection to the gateway ended (code=%s, reason=%s); "
