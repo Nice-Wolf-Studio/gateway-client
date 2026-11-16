@@ -67,11 +67,16 @@ service = GatewayService(
     }])
 ```
 
-- `instructions`: a string of at most 8192 characters. At `initialize` the
-  gateway returns, to each MCP app, the instructions of every service that
-  app may use, each under a `## <service>` header. A change
-  (`update(instructions=...)`) reaches an app at its next `initialize`; MCP
-  has no notice for it.
+- `instructions`: a string of at most 8192 characters. The gateway serves
+  them as its own resource `gateway://instructions/<service>`
+  (`text/markdown`) to the MCP apps that may use this service, and at
+  `initialize` returns only a short gateway section and an index naming that
+  resource (mcp-gateway docs/spec.md GW-16): clients cap a connector's
+  instructions (Claude Code at 4096 characters), so the services' text is
+  not sent there. A change (`update(instructions=...)`) is served from the
+  next read of the resource; the index changes at an app's next
+  `initialize`. A resource URI starting with `gateway://` is the gateway's
+  own; declaring one is `rejected` with `malformed_tool`.
 - `prompts`: MCP prompts the **gateway** serves from this declaration (no
   handler, no round trip). `prompts/list` shows them to the callers allowed
   to use the service, like tools; `prompts/get` fills each `{{argument}}`
