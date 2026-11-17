@@ -44,10 +44,12 @@ class Issuer:
 
     def claims(self, *, now: float | None = None, ttl: int = 60, sub: Any = PRINCIPAL,
                act: Any = APP, aud: Any = "svc", jti: Any = None,
-               drop: tuple[str, ...] = ()) -> dict:
+               agent: Any = _KEEP, drop: tuple[str, ...] = ()) -> dict:
         now = int(time.time() if now is None else now)
         claims = {"sub": sub, "act": act, "aud": aud, "iat": now, "exp": now + ttl,
                   "jti": jti if jti is not None else str(uuid.uuid4())}
+        if agent is not _KEEP:    # the optional `agent` claim: absent unless given
+            claims["agent"] = agent
         return {k: v for k, v in claims.items() if k not in drop}
 
     def token(self, *, kid: Any = _KEEP, **claims: Any) -> str:

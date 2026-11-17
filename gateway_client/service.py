@@ -90,6 +90,10 @@ class Caller:
     - `token`: the verified compact JWT, for a backend that must forward it
       (it is short-lived and for this service only; never log it).
     - `claims`: the verified claims (read-only).
+    - `agent`: the agent persona WRN (`wrn:access:agent/<id>`) the connected
+      app is bound to (the token's optional `agent` claim), or None when the
+      app is unbound or the gateway predates the claim. Validated like
+      `principal`; a malformed claim refuses the token.
     """
 
     principal: str
@@ -98,13 +102,15 @@ class Caller:
     request_id: str | None
     token: str = field(repr=False)
     claims: Any = field(repr=False, compare=False, default=None)
+    agent: str | None = None
 
     @classmethod
     def from_token(cls, verified: VerifiedToken, *, encryption: str,
                    request_id: str | None) -> "Caller":
         return cls(principal=verified.principal, app=verified.app,
                    encryption=encryption, request_id=request_id,
-                   token=verified.token, claims=verified.claims)
+                   token=verified.token, claims=verified.claims,
+                   agent=verified.agent)
 
 
 OnCall = Callable[[str, dict, Caller], Any]

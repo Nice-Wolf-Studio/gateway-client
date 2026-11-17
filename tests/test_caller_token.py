@@ -71,6 +71,41 @@ def test_valid_token_yields_principal_app_and_raw_token():
     assert token not in repr(verified)
 
 
+AGENT = "wrn:access:agent/3b0f6c1e-0000-4000-8000-000000000002"
+
+
+def test_token_without_agent_claim_has_agent_none():
+    issuer = Issuer()
+    verified = run(_verifier(Fetcher(issuer)).verify(issuer.token(now=NOW)))
+    assert verified.agent is None
+    assert "agent" not in verified.claims
+
+
+def test_agent_claim_is_exposed_and_stays_in_claims():
+    issuer = Issuer()
+    verified = run(_verifier(Fetcher(issuer)).verify(issuer.token(now=NOW, agent=AGENT)))
+    assert verified.agent == AGENT
+    assert verified.claims["agent"] == AGENT
+
+
+def test_agent_is_not_a_required_claim():
+    assert "agent" not in ct.REQUIRED_CLAIMS
+
+
+@pytest.mark.parametrize("bad", [
+    "", "   ", 7, True, ["x"], {"a": 1}, None,
+    "wrn:access:user/x", "wrn:access:client/x", "wrn:gateway:agent/x",
+    "wrn:access:agent/", "wrn:access:agent", "agent/x", "x",
+    "wrn:access:agent/a\x00b", "wrn:access:agent/a\nb", "wrn:access:agent/a\u200bb",
+    " wrn:access:agent/x", "wrn:access:agent/x ",
+])
+def test_malformed_agent_claim_refused(bad):
+    issuer = Issuer()
+    err = _refused(_verifier(Fetcher(issuer)), issuer.token(now=NOW, agent=bad))
+    assert err.code == "not_allowed"
+    assert "agent" in err.reason
+
+
 # --- one test per failure mode (all refused not_allowed) -----------------------------
 
 def test_bad_signature_refused():
