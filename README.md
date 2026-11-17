@@ -30,6 +30,7 @@ async def on_call(tool: str, arguments: dict, caller: Caller):
     # caller.principal  the principal WRN the call acts as (verified token `sub`)
     # caller.app        the connected app's WRN (verified token `act`)
     # caller.token      the verified GW-3 token, to forward if you must
+    # caller.agent      the agent WRN the app is bound to (token `agent`), or None
     # caller.claims     the verified claims; caller.encryption; caller.request_id
     if tool == "add":
         return str(arguments["a"] + arguments["b"])     # str, content blocks, or any JSON
@@ -101,7 +102,11 @@ are always non-blank strings with no leading or trailing whitespace and no
 Unicode `Cc` (control) or `Cf` (format) characters, never normalized (no
 `strip()`, case folding, or NFC/NFKC), because a call whose token fails any
 check never reaches the handler. Authorize on `caller.principal` (and, where
-it matters, `caller.app`). `caller.token` is the raw verified JWT,
+it matters, `caller.app`). `caller.agent` is the token's optional `agent`
+claim: the `wrn:access:agent/<id>` of the agent persona the connected app is
+bound to, or `None` when the app is unbound (or the gateway predates the
+claim); when present it is validated like `principal` and must be an agent
+WRN, else the token is refused. `caller.token` is the raw verified JWT,
 short-lived (at most 60 s) and valid for this service only; forward it only
 where something downstream must check it itself, and never log it.
 

@@ -34,7 +34,7 @@ This file provides load-bearing working notes and operational guidelines for AI 
 
 ### 3.1. Contract v2 Verification & Check Order
 When a frame arrives, `GatewayService._reply` enforces this strict precedence:
-1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control) or `Cf` (format) characters. Claims are never normalized.
+1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control) or `Cf` (format) characters. Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent). The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
 2. **`encryption` mode check** (`none` or `end-to-end`) → invalid yields `bad_arguments`.
 3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning.
 4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found`.
