@@ -28,7 +28,7 @@ from .pins import FilePinStore
 from .protocol import CONTRACT_VERSION, ToolResult
 from .service import Caller, GatewayService
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 __all__ = [
     "BAD_ARGUMENTS", "CONTRACT_VERSION", "ERROR_CODES", "INTERNAL", "NOT_ALLOWED",

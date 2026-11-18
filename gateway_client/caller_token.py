@@ -7,6 +7,9 @@ For every routed call the gateway sends a `caller_token`: a JWT signed EdDSA
     sub  the principal the call acts as (a WRN)
     act  the connected app the call came through (a WRN)
     aud  this service's name
+    agent  optional: the agent persona the connected app is bound to, a WRN
+           `wrn:access:agent/<id>`; absent when the app is unbound (and from
+           gateways that predate it)
     iat, exp (exp at most 60 s after iat), jti
 
 `CallerTokenVerifier.verify` checks, in order, and raises `TokenRefused` on
@@ -23,6 +26,8 @@ the first failure:
    Unicode `Cc` (control) or `Cf` (format) characters, kept as-is without
    normalization; `aud` is a string equal to this service's name (a list is
    refused even when it names the service: the token is for one backend);
+   When `agent` is present it is held to the same string rule and must be a
+   `wrn:access:agent/<id>` WRN with a non-empty id, else the token is refused.
 5. `exp` has not passed, allowing `leeway` seconds of clock skew, and is no
    more than 60 s plus `leeway` ahead (GW-3's maximum lifetime);
 6. `jti` has not been accepted before while the token could still be valid
@@ -94,6 +99,7 @@ class VerifiedToken:
     app: str                            # `act`
     token: str = field(repr=False)      # the compact JWT, for forwarding
     claims: Mapping[str, Any] = field(repr=False)
+    agent: str | None = None            # `agent`: agent WRN, None when absent
 
 
 def jwks_url_for(backend_url: str) -> str:
@@ -221,6 +227,18 @@ class KeySet:
 _FORBIDDEN_CATEGORIES = frozenset(("Cc", "Cf"))
 
 
+AGENT_WRN_PREFIX = "wrn:access:agent/"
+
+
+def _check_agent(value: Any) -> str:
+    """Validate the optional `agent` claim: an id string (`_check_id_str`)
+    that is a `wrn:access:agent/<id>` WRN with a non-empty id."""
+    _check_id_str("caller_token agent", value)
+    if not value.startswith(AGENT_WRN_PREFIX) or len(value) == len(AGENT_WRN_PREFIX):
+        raise TokenRefused("caller_token agent is not an agent WRN")
+    return value
+
+
 def _check_id_str(label: str, value: Any) -> str:
     """Validate a caller-identity or key-id string (`sub`, `act`, `jti`,
     header `kid`): a non-blank `str` with no leading or trailing whitespace
@@ -287,7 +305,8 @@ class CallerTokenVerifier:
             raise TokenRefused("caller_token was replayed (jti already used)")
         self._seen[jti] = float(claims["exp"]) + self._leeway
         return VerifiedToken(principal=claims["sub"], app=claims["act"], token=token,
-                             claims=MappingProxyType(dict(claims)))
+                             claims=MappingProxyType(dict(claims)),
+                             agent=claims.get("agent"))
 
     def _decode(self, token: str, key: jwt.PyJWK, now: float) -> dict[str, Any]:
         try:
@@ -310,6 +329,8 @@ class CallerTokenVerifier:
             raise TokenRefused("caller_token audience is not this service")
         for name in ("sub", "act", "jti"):
             _check_id_str(f"caller_token {name}", claims.get(name))
+        if "agent" in claims:
+            _check_agent(claims["agent"])
         exp = claims.get("exp")
         if isinstance(exp, bool) or not isinstance(exp, (int, float)):
             raise TokenRefused("caller_token exp is not a number")

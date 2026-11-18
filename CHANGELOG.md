@@ -3,6 +3,15 @@
 The version follows semantic versioning; before 1.0.0 a breaking change
 raises the minor version.
 
+## [0.5.0] - 2026-11-16
+
+Typed agent persona on the caller.
+
+### Added
+
+- Optional caller-token claim `agent`, a WRN of the form `wrn:access:agent/<id>`, present only when the calling connected app is bound to an agent persona. It is validated with the same rule as `sub` and `act` (non-blank string, no edge whitespace, no `Cc`/`Cf` characters) and must be an agent WRN; a malformed value refuses the token (`not_allowed`). It is not a required claim, so tokens from gateways that predate it still verify.
+- `VerifiedToken.agent: str | None` and `Caller.agent: str | None = None` (None when the claim is absent). The claim also stays visible in `caller.claims`.
+
 ## [0.4.2] - 2026-10-28
 
 Persistent downgrade pin store and owner decision on Q2/D2 (#3).

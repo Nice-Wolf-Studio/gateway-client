@@ -449,6 +449,37 @@ def test_call_dispatch_with_caller():
     assert token not in repr(caller)
 
 
+def test_caller_agent_is_none_without_the_claim_and_set_with_it():
+    agent = "wrn:access:agent/3b0f6c1e-0000-4000-8000-000000000002"
+    seen = []
+
+    async def on_call(tool, arguments, caller):
+        seen.append(caller)
+        return "ok"
+
+    frames = [_call(request_id="r-1", token=ISSUER.token()),
+              _call(request_id="r-2", token=ISSUER.token(agent=agent))]
+    run(_one_exchange(frames, service_kwargs={"on_call": on_call}))
+    plain, bound = seen
+    assert plain.agent is None and "agent" not in plain.claims
+    assert bound.agent == agent and bound.claims["agent"] == agent
+    assert "agent" in Caller.__dataclass_fields__
+
+
+def test_malformed_agent_claim_is_refused_before_the_handler():
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(caller)
+        return "ok"
+
+    token = ISSUER.token(agent="wrn:access:user/x")
+    _, replies = run(_one_exchange([_call(token=token)],
+                                   service_kwargs={"on_call": on_call}))
+    assert not called
+    assert replies[0]["type"] == "error" and replies[0]["code"] == "not_allowed"
+
+
 def test_sync_handler_runs_and_string_result_becomes_text_block():
     def on_call(tool, arguments, caller):  # sync: run in a worker thread
         time.sleep(0.01)
