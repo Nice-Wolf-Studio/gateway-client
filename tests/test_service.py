@@ -317,6 +317,58 @@ def test_connection_closed_by_gateway_logs_close_code_and_reason(caplog):
     assert "\n" not in msg
 
 
+def _first_delay_after_registered_close(code, reason="", *, rand=None):
+    """Fake gateway answers `registered`, then closes with `code`; returns the
+    first reconnect delay the run loop asked for."""
+    delays = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await ws.close(code, reason)
+
+        async def sleep(delay):
+            delays.append(delay)
+            if not done.done():
+                done.set_result(None)
+            await asyncio.sleep(0)
+
+        async with fake_gateway(handler) as url:
+            kwargs = {"sleep": sleep}
+            if rand is not None:
+                kwargs["rand"] = rand
+            await serve_until(make_service(url, **kwargs), done)
+
+    run(main())
+    return delays[0]
+
+
+def test_superseded_close_waits_the_retry_cap_before_reconnecting(caplog):
+    # 4001 "superseded": a newer instance of this service took over (a deploy
+    # running old and new side by side). Reconnecting at once would supersede
+    # it back, so wait RETRY_CAP_SECONDS (with the usual jitter: 15-30 s).
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        delay = _first_delay_after_registered_close(4001, "superseded")
+    assert 15 <= delay <= 30
+    superseded = [r for r in caplog.records if "superseded" in r.getMessage()
+                  and r.levelno == logging.INFO]
+    assert len(superseded) == 1
+    assert "\n" not in superseded[0].getMessage()
+
+
+def test_superseded_close_jitter_spans_half_to_full_retry_cap():
+    assert _first_delay_after_registered_close(4001, rand=lambda: 0.0) == 15
+    assert _first_delay_after_registered_close(4001, rand=lambda: 1.0) == 30
+
+
+def test_plain_close_after_registration_keeps_the_short_delay():
+    assert _first_delay_after_registered_close(1000, rand=lambda: 1.0) == 1
+
+
 def test_two_services_in_one_process_rejection_logs_name_their_own_service(caplog):
     async def main():
         loop = asyncio.get_running_loop()
