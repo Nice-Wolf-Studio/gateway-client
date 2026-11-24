@@ -34,6 +34,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable, MutableSet
 
 import jsonschema
+import referencing.exceptions
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -173,7 +174,7 @@ async def _invoke(fn: Callable[..., Any], *args: Any) -> Any:
 def _parse(raw: Any) -> dict[str, Any] | None:
     try:
         frame = loads_strict(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
     return frame if isinstance(frame, dict) else None
 
@@ -305,13 +306,49 @@ class GatewayService:
         self._ws: ClientConnection | None = None     # the registered connection
         self._conn: ClientConnection | None = None   # any open connection
         self._mode: str | None = None
-        self._send_lock = asyncio.Lock()
-        self._update_lock = asyncio.Lock()
+        self._send_lock: asyncio.Lock | None = None
+        self._send_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._update_lock: asyncio.Lock | None = None
+        self._update_lock_loop: asyncio.AbstractEventLoop | None = None
         self._pending_register: asyncio.Future | None = None
         self._rejected_on_update: str | None = None
         self._registered_event: asyncio.Event | None = None
+        self._registered_event_loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
+        self._stop_event_loop: asyncio.AbstractEventLoop | None = None
+        self._stopping: bool = False
+        self._connect_task: asyncio.Task[ClientConnection] | None = None
         self._tasks: set[asyncio.Task] = set()
+
+    def _get_send_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._send_lock is None or self._send_lock_loop is not loop:
+            self._send_lock, self._send_lock_loop = asyncio.Lock(), loop
+        return self._send_lock
+
+    def _get_update_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._update_lock is None or self._update_lock_loop is not loop:
+            self._update_lock, self._update_lock_loop = asyncio.Lock(), loop
+        return self._update_lock
+
+    def _get_registered_event(self) -> asyncio.Event:
+        loop = asyncio.get_running_loop()
+        if self._registered_event is None or self._registered_event_loop is not loop:
+            event = asyncio.Event()
+            if self._ws is not None:
+                event.set()
+            self._registered_event, self._registered_event_loop = event, loop
+        return self._registered_event
+
+    def _get_stop_event(self) -> asyncio.Event:
+        loop = asyncio.get_running_loop()
+        if self._stop_event is None or self._stop_event_loop is not loop:
+            event = asyncio.Event()
+            if self._stopping:
+                event.set()
+            self._stop_event, self._stop_event_loop = event, loop
+        return self._stop_event
 
     # --- public surface ------------------------------------------------------------
 
@@ -361,45 +398,55 @@ class GatewayService:
     async def run(self) -> None:
         """Connect, register and serve, reconnecting until `stop()`."""
         apply_env_format()
-        self._stop_event = asyncio.Event()
-        self._registered_event = self._registered_event or asyncio.Event()
+        stop_event = self._get_stop_event()
+        self._get_registered_event()
         last_problem: str | None = None
-        while not self._stop_event.is_set():
-            attempt = await self._attempt()
-            if self._stop_event.is_set():
-                break
-            superseded = (attempt.outcome is _Outcome.REGISTERED
-                          and attempt.close_code == SUPERSEDED_CLOSE_CODE)
-            if superseded:
-                last_problem = None
-                delay = self._backoff.superseded_delay()
-                log.info("service '%s': superseded by a newer registration of this "
-                         "service (code=%s); reconnecting in %.0f s",
-                         self._service, attempt.close_code, delay)
+        try:
+            while not (self._stopping or stop_event.is_set()):
+                attempt = await self._attempt()
+                if self._stopping or stop_event.is_set():
+                    break
+                superseded = (attempt.outcome is _Outcome.REGISTERED
+                              and attempt.close_code == SUPERSEDED_CLOSE_CODE)
+                if superseded:
+                    last_problem = None
+                    delay = self._backoff.superseded_delay()
+                    log.info("service '%s': superseded by a newer registration of this "
+                             "service (code=%s); reconnecting in %.0f s",
+                             self._service, attempt.close_code, delay)
+                    await self._sleep(delay)
+                    continue
+                if attempt.outcome is _Outcome.REGISTERED:
+                    last_problem = None
+                    log.info("service '%s': connection to the gateway ended (code=%s, reason=%s); "
+                             "reconnecting", self._service, attempt.close_code,
+                             _safe_str(attempt.close_reason))
+                elif attempt.reason != last_problem:
+                    last_problem = attempt.reason
+                    if attempt.outcome is _Outcome.REJECTED:
+                        log.error("service '%s' kid '%s' at %s: registration rejected: %s; "
+                                  "retrying with backoff up to 300 s",
+                                  self._service, self.kid, self._url, _safe_str(attempt.reason))
+                    else:
+                        log.warning("gateway connection problem: %s; retrying with backoff "
+                                    "up to 30 s", _safe_str(attempt.reason))
+                delay = self._backoff.next_delay(rejected=attempt.outcome is _Outcome.REJECTED)
                 await self._sleep(delay)
-                continue
-            if attempt.outcome is _Outcome.REGISTERED:
-                last_problem = None
-                log.info("service '%s': connection to the gateway ended (code=%s, reason=%s); "
-                         "reconnecting", self._service, attempt.close_code,
-                         _safe_str(attempt.close_reason))
-            elif attempt.reason != last_problem:
-                last_problem = attempt.reason
-                if attempt.outcome is _Outcome.REJECTED:
-                    log.error("service '%s' kid '%s' at %s: registration rejected: %s; "
-                              "retrying with backoff up to 300 s",
-                              self._service, self.kid, self._url, _safe_str(attempt.reason))
-                else:
-                    log.warning("gateway connection problem: %s; retrying with backoff "
-                                "up to 30 s", _safe_str(attempt.reason))
-            delay = self._backoff.next_delay(rejected=attempt.outcome is _Outcome.REJECTED)
-            await self._sleep(delay)
-        await self._drain()
+            await self._drain()
+        finally:
+            self._stopping = False
+            self._stop_event = None
+            self._stop_event_loop = None
 
     async def stop(self) -> None:
         """End `run()`: close the connection and stop reconnecting."""
-        if self._stop_event is not None:
+        self._stopping = True
+        loop = asyncio.get_running_loop()
+        if self._stop_event is not None and self._stop_event_loop is loop:
             self._stop_event.set()
+        connect_task = self._connect_task
+        if connect_task is not None and not connect_task.done() and connect_task.get_loop() is loop:
+            connect_task.cancel()
         conn = self._conn
         if conn is not None:
             await conn.close()
@@ -407,9 +454,7 @@ class GatewayService:
     async def wait_registered(self, timeout: float | None = None) -> None:
         """Wait until a registration is accepted (asyncio.TimeoutError after
         `timeout` seconds)."""
-        if self._registered_event is None:
-            self._registered_event = asyncio.Event()
-        await asyncio.wait_for(self._registered_event.wait(), timeout)
+        await asyncio.wait_for(self._get_registered_event().wait(), timeout)
 
     async def update(self, *, tools: Iterable[dict] | None = None,
                      resources: Iterable[dict] | None = None,
@@ -428,7 +473,7 @@ class GatewayService:
         restored (used on the next reconnect) and RegistrationRejected is
         raised. When not connected, the new declaration is used at the next
         registration and nothing is announced."""
-        async with self._update_lock:
+        async with self._get_update_lock():
             old = self._decl
             new = Declaration.build(
                 old.tools if tools is None else tools,
@@ -439,26 +484,32 @@ class GatewayService:
             tools_changed = list(new.tools) != list(old.tools)
             resources_changed = list(new.resources) != list(old.resources)
             prompts_changed = list(new.prompts) != list(old.prompts)
-            self._decl = new
             ws = self._ws
             if ws is None:
+                self._decl = new
                 return
+            cfg = self.config
+            frame = new.register(cfg.service_name, cfg.credential, cfg.key.public_b64)
             future = asyncio.get_running_loop().create_future()
             self._pending_register = future
             try:
-                await self._send(ws, self._register_frame())
+                await self._send(ws, frame)
                 reply = await asyncio.wait_for(future, self._reply_timeout)
             except (ConnectionClosed, ConnectionError, asyncio.TimeoutError) as exc:
+                self._decl = new
                 log.warning("re-registration not confirmed (%s); the new declaration "
                             "is used at the next registration", type(exc).__name__)
                 return
             finally:
                 self._pending_register = None
+                if future.done() and not future.cancelled():
+                    future.exception()
             if reply.get("type") != "registered":
                 reason = str(reply.get("reason"))
-                self._decl = old
                 self._rejected_on_update = reason
                 raise RegistrationRejected(reason)
+            self._decl = new
+            self._rejected_on_update = None
             log.info("re-registered: %d tool(s), %d resource(s), %d prompt(s), "
                      "instructions %s", len(new.tools), len(new.resources),
                      len(new.prompts), "set" if new.instructions else "none")
@@ -492,38 +543,56 @@ class GatewayService:
         """One connection: register, then serve until it ends."""
         log.info("connecting to %s (contract v2)", self.config.url)
         connector = _NoRedirectConnect if connect is _WS_CONNECT else connect
+        ws: ClientConnection | None = None
         try:
-            async with connector(self.config.url, max_size=self._max_frame_bytes,
-                                 open_timeout=self._reply_timeout,
-                                 logger=_transport_log) as ws:
-                self._conn = ws
-                if self._stop_event is not None and self._stop_event.is_set():
+            async def _open_ws() -> ClientConnection:
+                return await connector(
+                    self.config.url, max_size=self._max_frame_bytes,
+                    open_timeout=self._reply_timeout, logger=_transport_log)
+
+            connect_task = asyncio.create_task(_open_ws())
+            self._connect_task = connect_task
+            try:
+                ws = await connect_task
+            except asyncio.CancelledError:
+                if (connect_task.done() and not connect_task.cancelled()
+                        and connect_task.exception() is None):
+                    await connect_task.result().close()
+                if self._stopping or (self._stop_event is not None and self._stop_event.is_set()):
                     return _Attempt(_Outcome.FAILED, "stopping")
-                reply, code = await self._first_reply(ws, self._register_frame())
-                if reply is None:
-                    if code == -1:
-                        return _Attempt(_Outcome.FAILED, "no reply to register within "
-                                        f"{self._reply_timeout:g} s")
-                    return _Attempt(_Outcome.NO_REPLY, "connection closed without a reply "
-                                    f"to register (code {code})", code, ws.close_reason)
-                if reply["type"] == "rejected":
-                    return _Attempt(_Outcome.REJECTED, str(reply.get("reason")),
-                                    close_code=ws.close_code, close_reason=ws.close_reason)
-                self._on_registered(ws)
-                try:
-                    await self._serve(ws)
-                finally:
-                    self._on_disconnected()
-                if self._rejected_on_update is not None:
-                    reason, self._rejected_on_update = self._rejected_on_update, None
-                    return _Attempt(_Outcome.REJECTED, reason,
-                                    close_code=ws.close_code, close_reason=ws.close_reason)
-                return _Attempt(_Outcome.REGISTERED, close_code=ws.close_code,
-                                close_reason=ws.close_reason)
+                raise
+            finally:
+                self._connect_task = None
+            self._conn = ws
+            if self._stopping or (self._stop_event is not None and self._stop_event.is_set()):
+                return _Attempt(_Outcome.FAILED, "stopping")
+            reply, code = await self._first_reply(ws, self._register_frame())
+            if reply is None:
+                if code == -1:
+                    return _Attempt(_Outcome.FAILED, "no reply to register within "
+                                    f"{self._reply_timeout:g} s")
+                return _Attempt(_Outcome.NO_REPLY, "connection closed without a reply "
+                                f"to register (code {code})", code, ws.close_reason)
+            if reply["type"] == "rejected":
+                return _Attempt(_Outcome.REJECTED, str(reply.get("reason")),
+                                close_code=ws.close_code, close_reason=ws.close_reason)
+            self._on_registered(ws)
+            try:
+                await self._serve(ws)
+            finally:
+                self._on_disconnected()
+            if self._rejected_on_update is not None:
+                reason, self._rejected_on_update = self._rejected_on_update, None
+                return _Attempt(_Outcome.REJECTED, reason,
+                                close_code=ws.close_code, close_reason=ws.close_reason)
+            return _Attempt(_Outcome.REGISTERED, close_code=ws.close_code,
+                            close_reason=ws.close_reason)
         except (OSError, asyncio.TimeoutError, WebSocketException) as exc:
             return _Attempt(_Outcome.FAILED, f"cannot connect ({type(exc).__name__})")
         finally:
             self._conn = None
+            if ws is not None:
+                await ws.close()
 
     async def _first_reply(self, ws: ClientConnection,
                            frame: dict[str, Any]) -> tuple[dict | None, int | None]:
@@ -554,10 +623,9 @@ class GatewayService:
 
     def _on_registered(self, ws: ClientConnection) -> None:
         self._ws, self._mode = ws, MODE_V2
+        self._rejected_on_update = None
         self._backoff.reset()
-        if self._registered_event is None:
-            self._registered_event = asyncio.Event()
-        self._registered_event.set()
+        self._get_registered_event().set()
         d = self._decl
         log.info("registered as service %r (contract v2): %d tool(s), %d resource(s), "
                  "%d prompt(s), instructions %s, kid %s; caller tokens checked against "
@@ -567,8 +635,12 @@ class GatewayService:
 
     def _on_disconnected(self) -> None:
         self._ws, self._mode = None, None
-        if self._registered_event is not None:
+        if (self._registered_event is not None
+                and self._registered_event_loop is asyncio.get_running_loop()):
             self._registered_event.clear()
+        else:
+            self._registered_event = None
+            self._registered_event_loop = None
         pending = self._pending_register
         if pending is not None and not pending.done():
             pending.set_exception(ConnectionError("connection closed"))
@@ -595,7 +667,7 @@ class GatewayService:
             pass
 
     async def _send(self, ws: ClientConnection, frame: dict[str, Any]) -> None:
-        async with self._send_lock:
+        async with self._get_send_lock():
             await ws.send(json.dumps(frame, allow_nan=False))
 
     async def _announce(self, ftype: str) -> bool:
@@ -610,9 +682,9 @@ class GatewayService:
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
-        assert self._stop_event is not None
+        stop_event = self._get_stop_event()
         try:
-            await asyncio.wait_for(self._stop_event.wait(), delay)
+            await asyncio.wait_for(stop_event.wait(), delay)
         except asyncio.TimeoutError:
             pass
 
@@ -697,7 +769,9 @@ class GatewayService:
             raise ServiceError(BAD_ARGUMENTS, f"arguments do not match the tool's "
                                               f"inputSchema at {where}: {exc.message}"
                                ) from None
-        except jsonschema.SchemaError:
+        except RecursionError:
+            raise ServiceError(BAD_ARGUMENTS, "arguments are too deeply nested") from None
+        except (jsonschema.SchemaError, referencing.exceptions.Unresolvable):
             raise ServiceError(INTERNAL, "the tool's inputSchema is invalid") from None
 
     @staticmethod
@@ -806,6 +880,9 @@ class GatewayService:
                 self._check_plaintext_allowed(caller.app)
                 arguments = frame.get("payload")
             payload, is_error = await self._run_handler(is_call, target, declared, arguments, caller)
+        except asyncio.CancelledError:
+            call_log.end("cancelled")
+            raise
         except (ServiceError, e2e.E2EError) as exc:
             code, message = exc.code, str(exc)
         except Exception as exc:  # the service's own failure: never leak its text

@@ -65,9 +65,9 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
 ### 2.2 How a service embeds it
 
 1. Build `GatewayService(tools=..., on_call=..., resources=..., on_read=...)` [as-built]
-   (`service.py:161-177`). The declaration is validated locally first: every tool needs a
-   non-empty `name`, a string `description` and an object `inputSchema`; every resource a
-   non-empty `uri` and string `name`, `mimeType`, `description`; no duplicate tool names or
+   (`service.py:161-177`). The declaration is deep-copied and validated locally first: every tool needs a
+   non-blank `name` (without edge whitespace), a string `description`, and a JSON-serializable, valid `inputSchema` dict; every resource a
+   non-blank `uri` (without edge whitespace) and string `name`, `mimeType`, `description`; no duplicate tool names or
    resource URIs. A mistake raises `ValueError` at start, not as a `rejected` loop [as-built]
    (`protocol.py:40-62`, `service.py:177`). `roles=` / `roles_version=` no longer exist and raise
    `TypeError` [as-built] (`tests/test_service.py:97-102`). Passing both `config=` and
@@ -99,7 +99,7 @@ Dependencies: `websockets>=13,<17`, `pyhpke>=0.6.5,<0.7`, `cryptography>=42`,
 | Legacy fallback | Removed in v0.2.0: there is no legacy (pre-contract) protocol, `WN_BACKEND_TOKEN` and `BACKEND_ID` are gone. A gateway that closes **without** answering the register (or no reply within 30 s) is retried with contract v2 and backoff capped at 30 s. | `protocol.py:9`, `service.py:343-348`, `251-255`; `CHANGELOG.md:53-56`; `tests/test_config.py:44-51` |
 | Dropped connection | Backoff capped at 30 s; reset after a successful registration. | `protocol.py:21`, `service.py:392-394` |
 | Superseded | A registered connection closed by the gateway with code `4001` (`SUPERSEDED_CLOSE_CODE`: a newer registration of the same service replaced it) is logged once at INFO and retried after `RETRY_CAP_SECONDS` with the usual jitter (15-30 s) instead of the reset short delay; any other close is unchanged. | `protocol.py` `SUPERSEDED_CLOSE_CODE`, `Backoff.superseded_delay`; `service.py` `run`; `tests/test_service.py` `test_superseded_close_*` |
-| Changes | `update(tools=..., resources=..., prompts=..., instructions=...)` re-registers on the same connection; accepted → `tools_changed` if the tools changed, `resources_changed` if the resources changed, `prompts_changed` if the prompts changed (with `announce=True`; instructions have no announcement: the gateway serves them as the resource `gateway://instructions/<SERVICE_NAME>` from the next read, and indexes them at an app's next `initialize`); rejected → previous declaration restored, `RegistrationRejected` raised, and the 300 s cap applies after the disconnect. | `service.py:273-316`, `356-358` |
+| Changes | `update(tools=..., resources=..., prompts=..., instructions=...)` re-registers on the same connection (updating `self._decl` only once `registered` is confirmed, or on disconnect/timeout for the next reconnect); accepted → clears any prior update rejection and sends `tools_changed` if the tools changed, `resources_changed` if the resources changed, `prompts_changed` if the prompts changed (with `announce=True`; instructions have no announcement: the gateway serves them as the resource `gateway://instructions/<SERVICE_NAME>` from the next read, and indexes them at an app's next `initialize`); rejected → previous declaration stays active, `RegistrationRejected` raised, and the 300 s cap applies after the disconnect. | `service.py:273-316`, `356-358` |
 
 ### 2.4 Call handshake (contract v2, auth)
 

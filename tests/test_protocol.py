@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+
+import pytest
+
 from gateway_client.protocol import (
     ToolResult,
     content_blocks,
@@ -175,3 +178,32 @@ def test_parse_tool_result_preserves_domain_dicts_with_is_error_fields():
     blocks5, is_error5 = parse_tool_result(wrapped_exact)
     assert is_error5 is True
     assert json.loads(blocks5[0]["text"]) == {"content": "hello", "is_error": False}
+
+
+    assert is_error is False
+
+
+def test_declaration_build_rejects_blank_names_non_json_and_invalid_schemas():
+    from gateway_client.protocol import Declaration
+
+    for bad_name in ("", "   ", " t", "t "):
+        with pytest.raises(ValueError):
+            Declaration.build([{"name": bad_name, "description": "d", "inputSchema": {"type": "object"}}])
+    for bad_uri in ("", "   ", " res://x", "res://x "):
+        with pytest.raises(ValueError):
+            Declaration.build([], [{"uri": bad_uri, "name": "n", "mimeType": "text/plain", "description": "d"}])
+    with pytest.raises(ValueError):
+        Declaration.build([{"name": "t", "description": "d", "inputSchema": {"type": str}}])
+    with pytest.raises(ValueError):
+        Declaration.build([{"name": "t", "description": "d", "inputSchema": {"type": "not-a-type"}}])
+
+
+def test_declaration_build_deep_copies_mutable_inputs():
+    from gateway_client.protocol import Declaration
+
+    tools = [{"name": "t", "description": "v1", "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}]
+    decl = Declaration.build(tools)
+    tools[0]["description"] = "v2"
+    tools[0]["inputSchema"]["properties"]["x"]["type"] = "integer"
+    assert decl.tools[0]["description"] == "v1"
+    assert decl.tools[0]["inputSchema"]["properties"]["x"]["type"] == "string"

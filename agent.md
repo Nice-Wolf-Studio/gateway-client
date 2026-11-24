@@ -45,13 +45,13 @@ When a frame arrives, `GatewayService._reply` enforces this strict precedence:
 
 ### 3.2. Statelessness & Pin Persistence (Q2 / D2)
 - **Stateless by default**: In-memory pinning (`self._pinned: set[str] = set()`) is the default, maintaining zero file side effects and preventing permanent lockouts if an operator toggles an app's encryption in `mcp-gateway`.
-- **Opt-in persistence**: Set `SERVICE_PIN_STORE_FILE` in environment or pass `pin_store=FilePinStore(path)` to `GatewayService`. `FilePinStore` uses atomic file replacement (`mkstemp` + `fsync` + `os.replace`) with `0600` permissions.
+- **Opt-in persistence**: Set `SERVICE_PIN_STORE_FILE` in environment or pass `pin_store=FilePinStore(path)` to `GatewayService`. `FilePinStore` fails closed on unreadable/corrupt pin files or directory paths, tracks `(st_mtime_ns, st_size, st_ino)` for external reloads, and uses thread-safe atomic file replacement (`mkstemp` + `fsync` + `os.replace`) with `0600` permissions.
 
 ### 3.3. Strict Privacy & Metadata-Only Logging Invariant
 - **Never logged**: arguments, results, error text from handlers, `SERVICE_CREDENTIAL`, `SERVICE_PRIVATE_KEY`, or `Caller.token` (the raw JWT).
 - **No heuristic redaction**: zero key-name pattern matching or partial masking.
-- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r`, `\n`, `\t`, and all `Cc`/`Cf`/`Zl`/`Zp` characters); `to_json` escapes `\u2028`, `\u2029`, and `\x85` so JSONL records remain single-line under `str.splitlines()`.
-- **Structured call tracing**: routed requests emit `call.start` and `call.end` events capturing `request_id`, `tool`/`uri`, `principal`, `app`, `duration_ms`, and `outcome`. Setting `GATEWAY_LOG_FORMAT=json` outputs structured JSON logs.
+- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r`, `\n`, `\t`, and all `Cc`/`Cf`/`Zl`/`Zp` characters), and `_kv_value` quotes empty strings or values containing whitespace, `=`, or `"` as JSON strings; `to_json` escapes `\u2028`, `\u2029`, and `\x85` so JSONL records remain single-line under `str.splitlines()`.
+- **Structured call tracing**: routed requests emit `call.start` and `call.end` events capturing `request_id`, `tool`/`uri`, `principal`, `app`, `duration_ms`, and `outcome` (including `outcome="cancelled"` when an in-flight handler is cancelled). Setting `GATEWAY_LOG_FORMAT=json` outputs structured JSON logs.
 - **Context helper**: `current_request_id()` returns the active request ID inside handlers across async boundaries, and `None` outside.
 
 ### 3.4. Application Tool Errors (`isError=True`)

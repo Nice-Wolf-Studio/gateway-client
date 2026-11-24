@@ -117,3 +117,71 @@ def test_file_pin_store_round_trip_and_discard_exact(tmp_path: Path):
     assert val in FilePinStore(path)
     store.discard(f" {val} ")
     assert val in store
+
+
+def test_file_pin_store_directory_rejected_without_chmod(tmp_path: Path):
+    d = tmp_path / "dir"
+    d.mkdir()
+    os.chmod(d, 0o755)
+    with pytest.raises(IsADirectoryError):
+        FilePinStore(d)
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o755
+
+
+def test_file_pin_store_fails_closed_on_unreadable_or_corrupt_utf8(tmp_path: Path, monkeypatch):
+    path = tmp_path / "pins.txt"
+    path.write_bytes(b"\xff\xfe\xfd")
+    with pytest.raises(UnicodeDecodeError):
+        FilePinStore(path)
+    # File was not overwritten
+    assert path.read_bytes() == b"\xff\xfe\xfd"
+
+    valid_path = tmp_path / "valid.txt"
+    s = FilePinStore(valid_path)
+    s.add("wrn:access:client/app-1")
+    orig_read_text = Path.read_text
+
+    def fail_read(self, *args, **kwargs):
+        if self == valid_path:
+            raise PermissionError(13, "Permission denied", str(valid_path))
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_read)
+    with pytest.raises(PermissionError):
+        FilePinStore(valid_path)
+    monkeypatch.undo()
+    assert "wrn:access:client/app-1" in FilePinStore(valid_path)
+
+
+def test_file_pin_store_reloads_on_atomic_replace_with_identical_mtime_ns(tmp_path: Path):
+    path = tmp_path / "pins.txt"
+    store = FilePinStore(path)
+    mtime_ns = path.stat().st_mtime_ns
+
+    tmp_new = tmp_path / "pins.txt.new"
+    tmp_new.write_text("wrn:access:client/replaced\n", encoding="utf-8")
+    os.utime(tmp_new, ns=(mtime_ns, mtime_ns))
+    os.replace(tmp_new, path)
+    assert path.stat().st_mtime_ns == mtime_ns
+    assert "wrn:access:client/replaced" in store
+
+
+def test_file_pin_store_save_never_double_closes_fd_on_replace_failure(tmp_path: Path, monkeypatch):
+    path = tmp_path / "pins.txt"
+    store = FilePinStore(path)
+    closed_fds = []
+    real_close = os.close
+
+    def tracking_close(fd):
+        closed_fds.append(fd)
+        return real_close(fd)
+
+    def failing_replace(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        store.add("wrn:access:client/app-x")
+    assert len(closed_fds) == 1
+    assert [p for p in tmp_path.iterdir() if p.name.startswith(".pins.txt.tmp")] == []
