@@ -209,3 +209,7 @@ pip install -r ../mcp-gateway/requirements.txt
 MCP_GATEWAY_DIR=../mcp-gateway TEST_DATABASE_URL=postgresql://... \
     python -m pytest tests/test_gateway_e2e.py
 ```
+
+## Deploying through wolf-pack
+
+Production deploys only from [`Nice-Wolf-Studio/wolf-pack`](https://github.com/Nice-Wolf-Studio/wolf-pack). This library is not deployed on its own, so merging here, to `development` or `main`, ships nothing. It reaches production only inside a service: bump the pin in the consuming service, merge that, pin the service's commit in wolf-pack (`python tools/pack.py pin <path> <commit>`), open a wolf-pack PR to `development` with a cross-family review, merge it, promote wolf-pack `development` to `main`, and deploy through wolf-pack ([wolf-infra ADR 0005](https://github.com/Nice-Wolf-Studio/wolf-infra/blob/development/docs/adr/0005-wolf-pack-manifest-repository.md)).

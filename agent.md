@@ -7,7 +7,7 @@ This file provides load-bearing working notes and operational guidelines for AI 
 ## 1. Branch Model & GitHub Rulesets
 
 - **`development` is the active integration branch.** All feature branches, bugfixes, and refactors branch from `origin/development` and open PRs targeting `development`.
-- **`main` is production and the default GitHub branch.** 
+- **`main` is the release branch and the default GitHub branch.** Merging it ships nothing (see "Deploying through wolf-pack").
   - `development` is promoted to `main` at release milestones via a promotion PR (`development → main`).
   - Promotion PRs merge with a merge commit (`gh pr merge <num> --merge`), not squash, preserving individual commit history between branches.
 - **GitHub Rulesets (`platform-main` and `platform-development`):**
@@ -92,3 +92,7 @@ Driver constraints (`tests/gateway_e2e_driver.py`):
   for t in $(git tag -l 'v*'); do git show "$t:pyproject.toml" | grep -q "version = \"${t#v}\"" || echo "Mismatch on $t"; done
   ```
 - Always update `CHANGELOG.md` with release notes before tagging.
+
+## Deploying through wolf-pack
+
+Production deploys only from [`Nice-Wolf-Studio/wolf-pack`](https://github.com/Nice-Wolf-Studio/wolf-pack). This library is not deployed on its own, so merging here, to `development` or `main`, ships nothing. It reaches production only inside a service: bump the pin in the consuming service, merge that, pin the service's commit in wolf-pack (`python tools/pack.py pin <path> <commit>`), open a wolf-pack PR to `development` with a cross-family review, merge it, promote wolf-pack `development` to `main`, and deploy through wolf-pack ([wolf-infra ADR 0005](https://github.com/Nice-Wolf-Studio/wolf-infra/blob/development/docs/adr/0005-wolf-pack-manifest-repository.md)).
