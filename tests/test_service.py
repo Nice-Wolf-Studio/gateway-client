@@ -317,6 +317,58 @@ def test_connection_closed_by_gateway_logs_close_code_and_reason(caplog):
     assert "\n" not in msg
 
 
+def _first_delay_after_registered_close(code, reason="", *, rand=None):
+    """Fake gateway answers `registered`, then closes with `code`; returns the
+    first reconnect delay the run loop asked for."""
+    delays = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await ws.close(code, reason)
+
+        async def sleep(delay):
+            delays.append(delay)
+            if not done.done():
+                done.set_result(None)
+            await asyncio.sleep(0)
+
+        async with fake_gateway(handler) as url:
+            kwargs = {"sleep": sleep}
+            if rand is not None:
+                kwargs["rand"] = rand
+            await serve_until(make_service(url, **kwargs), done)
+
+    run(main())
+    return delays[0]
+
+
+def test_superseded_close_waits_the_retry_cap_before_reconnecting(caplog):
+    # 4001 "superseded": a newer instance of this service took over (a deploy
+    # running old and new side by side). Reconnecting at once would supersede
+    # it back, so wait RETRY_CAP_SECONDS (with the usual jitter: 15-30 s).
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        delay = _first_delay_after_registered_close(4001, "superseded")
+    assert 15 <= delay <= 30
+    superseded = [r for r in caplog.records if "superseded" in r.getMessage()
+                  and r.levelno == logging.INFO]
+    assert len(superseded) == 1
+    assert "\n" not in superseded[0].getMessage()
+
+
+def test_superseded_close_jitter_spans_half_to_full_retry_cap():
+    assert _first_delay_after_registered_close(4001, rand=lambda: 0.0) == 15
+    assert _first_delay_after_registered_close(4001, rand=lambda: 1.0) == 30
+
+
+def test_plain_close_after_registration_keeps_the_short_delay():
+    assert _first_delay_after_registered_close(1000, rand=lambda: 1.0) == 1
+
+
 def test_two_services_in_one_process_rejection_logs_name_their_own_service(caplog):
     async def main():
         loop = asyncio.get_running_loop()
@@ -1920,5 +1972,714 @@ def test_e2e_call_success_fails_if_opened_as_error():
         e2e.open_envelope(reply["payload"], recipient=client,
                            sender_public_raw=service_key.public_raw,
                            fields=e2e.reply_header(fields, reply["request_id"], is_error=True))
+
+
+# --- #43, #47, #48 service integration tests -----------------------------------------
+
+@pytest.mark.parametrize("kind", ["call", "read_resource"])
+def test_service_refuses_nan_exp_token_before_handler_and_logs_once(kind, caplog):
+    import json as _json
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(tool)
+        return "ok"
+
+    async def on_read(uri, caller):
+        called.append(uri)
+        return "ok"
+
+    hdr = e2e.b64url_encode(_json.dumps({"alg": "EdDSA", "kid": ISSUER.kid}).encode())
+    now_i = int(time.time())
+    body = e2e.b64url_encode(
+        f'{{"sub":"{PRINCIPAL}","act":"{APP}","aud":"svc","iat":{now_i},"exp":NaN,"jti":"j-svc-nan-{kind}"}}'.encode()
+    )
+    sig = e2e.b64url_encode(ISSUER._key.sign(f"{hdr}.{body}".encode()))
+    tok = f"{hdr}.{body}.{sig}"
+
+    frame = (_call(payload={"text": "x"}, token=tok, request_id="r-nan-call") if kind == "call"
+             else _read(token=tok, request_id="r-nan-read"))
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call, "on_read": on_read}))
+    assert replies == [{"type": "error", "request_id": frame["request_id"],
+                        "encryption": "none", "code": "not_allowed", "payload": TOKEN_REFUSED}]
+    assert called == []
+    warnings = [r for r in caplog.records
+                if r.name.startswith("gateway_client") and r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert tok not in caplog.text
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_e2e_call_with_nonfinite_json_answered_bad_arguments_before_on_call(constant):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(arguments)
+        return "ok"
+
+    bounded_tools = [{
+        "name": "pay", "description": "Pay.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"amount": {"type": "number", "minimum": 0, "maximum": 100}},
+            "required": ["amount"],
+        },
+    }]
+    fields = _fields("pay")
+    nonce = e2e.b64url_encode(b"\x02" * 16)
+    sent_at = int(time.time())
+    enc, ctx = e2e._SUITE.create_sender_context(
+        e2e._kem_public(service_key.public_raw), info=e2e.HPKE_INFO, sks=e2e._kem_private(client)
+    )
+    ct = ctx.seal(f'{{"amount": {constant}}}'.encode("utf-8"),
+                  aad=e2e.associated_data(fields, nonce, sent_at))
+    env = {
+        "alg": e2e.ALG, "mode": e2e.MODE, "kid": client.kid,
+        "enc": e2e.b64url_encode(enc), "ct": e2e.b64url_encode(ct),
+        "nonce": nonce, "sent_at": sent_at,
+    }
+    frame = _call(tool="pay", payload=env, request_id="r-e2e-nan",
+                  encryption="end-to-end", client_public_key=client.public_b64,
+                  client_kid=client.kid)
+
+    async def main():
+        from helpers import make_config
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await send_json(ws, frame)
+            done.set_result(await recv_json(ws))
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = GatewayService(
+                tools=bounded_tools, on_call=on_call,
+                config=make_config(url, key=service_key),
+                jwks_fetch=lambda _u: ISSUER.jwks(),
+            )
+            return await serve_until(svc, done)
+
+    reply = run(main())
+    assert reply["type"] == "error"
+    assert reply["code"] == "bad_arguments"
+    assert called == []
+
+
+@pytest.mark.parametrize("bad_raw", [
+    '{"type":"call","payload":{"x":NaN}}',
+    '{"type":"call","payload":{"x":Infinity}}',
+    '{"type":"call","payload":{"x":-Infinity}}',
+])
+def test_parse_rejects_nonfinite_json_constants(bad_raw):
+    from gateway_client.service import _parse
+    assert _parse(bad_raw) is None
+
+
+def test_websocket_redirect_refused_without_sending_credential():
+    from websockets.asyncio.server import serve
+
+    target_received = []
+
+    async def target_handler(ws):
+        target_received.append(await ws.recv())
+        await ws.close()
+
+    async def main():
+        async with serve(target_handler, "127.0.0.1", 0) as target_srv:
+            target_port = target_srv.sockets[0].getsockname()[1]
+            redirect_seen = asyncio.Event()
+
+            async def raw_http_redirect(reader, writer):
+                await reader.read(4096)
+                redirect_seen.set()
+                writer.write(
+                    f"HTTP/1.1 302 Found\r\nLocation: ws://127.0.0.1:{target_port}/backend\r\nContent-Length: 0\r\n\r\n".encode()
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            srv = await asyncio.start_server(raw_http_redirect, "127.0.0.1", 0)
+            redir_port = srv.sockets[0].getsockname()[1]
+            try:
+                svc = make_service(f"ws://127.0.0.1:{redir_port}/backend")
+                runner = asyncio.create_task(svc.run())
+                await asyncio.wait_for(redirect_seen.wait(), 5.0)
+                await asyncio.sleep(0.1)
+                await svc.stop()
+                await asyncio.wait_for(runner, 5.0)
+            finally:
+                srv.close()
+                await srv.wait_closed()
+
+    run(main())
+    assert target_received == []
+
+
+def test_outbound_wire_serializers_reject_nonfinite_floats():
+    from gateway_client.protocol import content_blocks, resource_contents
+
+    class FakeWS:
+        async def send(self, data):
+            pass
+
+    svc = make_service("ws://127.0.0.1:1/backend")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            content_blocks({"x": bad})
+        with pytest.raises(ValueError):
+            resource_contents({"x": bad}, "svc://s", "text/plain")
+        with pytest.raises(ValueError):
+            run(svc._send(FakeWS(), {"payload": bad}))
+
+
+# --- #44, #45, #50 service tests --------------------------------------------------------
+
+def test_failed_open_envelope_does_not_pin_app_and_allows_later_none_call(tmp_path):
+    client, impostor, service_key = KeyPair.generate(), KeyPair.generate(), KeyPair.generate()
+    pin_file = tmp_path / "pins.txt"
+    app = APP
+
+    bad_shapes = [
+        "not-an-envelope",
+        {},
+    ]
+    # Wrong envelope kid
+    wrong_kid_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                             fields=_fields())
+    wrong_kid_env["kid"] = impostor.kid
+    # Tampered ciphertext
+    tampered_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                            fields=_fields())
+    tampered_env["ct"] = e2e.b64url_encode(b"\xff" * 24)
+    # Wrong sender key
+    wrong_sender_env = e2e.seal({"text": "x"}, sender=impostor, recipient_public_raw=service_key.public_raw,
+                                fields=_fields())
+    wrong_sender_env["kid"] = client.kid
+    # Stale sent_at
+    stale_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                         fields=_fields(), now=time.time() - 301)
+
+    bad_frames = []
+    for idx, env in enumerate([*bad_shapes, wrong_kid_env, tampered_env, wrong_sender_env, stale_env]):
+        bad_frames.append(_call(
+            tool="echo", payload=env, request_id=f"r-bad-{idx}",
+            encryption="end-to-end", client_public_key=client.public_b64,
+            client_kid=client.kid, token=ISSUER.token(act=app),
+        ))
+    # Follow-up plaintext call must STILL succeed
+    plain = _call(tool="echo", payload={"text": "still-allowed"}, request_id="r-plain-ok",
+                  encryption="none", token=ISSUER.token(act=app))
+
+    _, replies = run(_one_exchange([*bad_frames, plain], service_kwargs={
+        "key": service_key, "pin_store_file": pin_file}))
+    assert all(r["type"] == "error" for r in replies[:-1])
+    assert replies[-1]["type"] == "result"
+    assert replies[-1]["payload"] == [{"type": "text", "text": "echo:still-allowed"}]
+    assert app not in FilePinStore(pin_file)
+
+
+def test_replayed_nonce_first_call_pins_but_first_time_stale_or_failed_does_not():
+    # Also verify AC3 of #44: valid open_envelope pins even if _check_schema or on_call raises ServiceError
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def failing_call(tool, arguments, caller):
+        raise ServiceError("unavailable", "downstream down")
+
+    # 1. Valid envelope, fails _check_schema (missing required "text") -> pins app
+    bad_schema_frame, _ = _e2e_call(client, service_key.public_raw, {"wrong": 1}, request_id="r-schema")
+    plain_after_schema = _call(payload={"text": "x"}, request_id="r-plain-1")
+    _, replies1 = run(_one_exchange([bad_schema_frame, plain_after_schema],
+                                    service_kwargs={"key": service_key}))
+    assert replies1[0]["code"] == "bad_arguments"
+    assert replies1[1]["code"] == "not_allowed"
+
+    # 2. Valid envelope, handler raises ServiceError -> pins app
+    ok_frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"}, request_id="r-svc-err")
+    plain_after_err = _call(payload={"text": "x"}, request_id="r-plain-2")
+    _, replies2 = run(_one_exchange([ok_frame, plain_after_err],
+                                    service_kwargs={"key": service_key, "on_call": failing_call}))
+    assert replies2[0]["code"] == "unavailable"
+    assert replies2[1]["code"] == "not_allowed"
+
+    # 3. Replayed nonce from app1 is tested after app1 already succeeded once;
+    #    test fresh app2 with replayed nonce via shared ReplayGuard? Impossible without prior claim,
+    #    so verify directly on ReplayGuard pre-claimed nonce:
+    svc = make_service("ws://localhost:9999", issuer=ISSUER, key=service_key)
+    env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                   fields=_fields())
+    svc._replay.claim(APP, env["nonce"], time.time())
+    replay_frame = _call(tool="echo", payload=env, request_id="r-rep", encryption="end-to-end",
+                         client_public_key=client.public_b64, client_kid=client.kid)
+    rep = run(svc._reply(replay_frame))
+    assert rep["code"] == "not_allowed"
+    assert APP not in svc.pinned
+
+
+def test_ac23_undeclared_tool_and_declared_not_found_match_in_e2e_mode():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def on_call(tool, arguments, caller):
+        raise ServiceError("not_found", "unknown tool: nonexistent_tool")
+
+    declared_frame, declared_fields = _e2e_call(
+        client, service_key.public_raw, {"text": "x"}, tool="echo", request_id="r-decl"
+    )
+    undeclared_frame, undeclared_fields = _e2e_call(
+        client, service_key.public_raw, {"text": "x"}, tool="nonexistent_tool",
+        request_id="r-undecl"
+    )
+
+    _, replies = run(_one_exchange([declared_frame, undeclared_frame],
+                                   service_kwargs={"key": service_key, "on_call": on_call}))
+    r_decl, r_undecl = replies
+    assert set(r_decl) == set(r_undecl)
+    assert r_decl["code"] == r_undecl["code"] == "not_found"
+    assert isinstance(r_decl["payload"], dict)
+    assert isinstance(r_undecl["payload"], dict)
+    assert _open_reply(r_decl, client, service_key, declared_fields) == "unknown tool: nonexistent_tool"
+    assert _open_reply(r_undecl, client, service_key, undeclared_fields) == "unknown tool: nonexistent_tool"
+
+
+def test_e2e_undeclared_resource_and_none_on_read_are_sealed_not_found():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def on_read(uri, caller):
+        return "ok"
+
+    def read_frame(uri, req_id):
+        return _read(
+            uri=uri, request_id=req_id, encryption="end-to-end",
+            client_public_key=client.public_b64, client_kid=client.kid,
+        )
+
+    # Case 1: undeclared URI when on_read is provided
+    f1 = read_frame("svc://missing", "r-read-undecl")
+    _, replies1 = run(_one_exchange([f1], service_kwargs={"key": service_key, "on_read": on_read}))
+    assert replies1[0]["code"] == "not_found"
+    assert isinstance(replies1[0]["payload"], dict)
+    fields1 = e2e.header(user_id=PRINCIPAL, client_id=APP, service="svc", uri="svc://missing")
+    assert _open_reply(replies1[0], client, service_key, fields1) == "unknown resource: svc://missing"
+
+    # Case 2: declared URI when on_read is None
+    f2 = read_frame("svc://status", "r-read-nohandler")
+    _, replies2 = run(_one_exchange([f2], service_kwargs={"key": service_key, "on_read": None}))
+    assert replies2[0]["code"] == "not_found"
+    assert isinstance(replies2[0]["payload"], dict)
+    fields2 = e2e.header(user_id=PRINCIPAL, client_id=APP, service="svc", uri="svc://status")
+    assert _open_reply(replies2[0], client, service_key, fields2) == "unknown resource: svc://status"
+
+    # Case 3: undeclared E2E target must not pin caller.app
+    plain_followup = _call(tool="echo", payload={"text": "still-allowed"}, request_id="r-plain-after-undecl")
+    _, replies3 = run(_one_exchange(
+        [read_frame("svc://missing", "r-read-undecl-2"), plain_followup],
+        service_kwargs={"key": service_key, "on_read": on_read},
+    ))
+    assert replies3[0]["code"] == "not_found"
+    assert replies3[1]["type"] == "result"
+
+
+def test_none_mode_non_serializable_list_sends_internal_and_logs_internal(caplog):
+    async def on_call(tool, arguments, caller):
+        if arguments.get("text") == "nan":
+            return [{"type": "text", "text": float("nan")}]
+        return [{"type": "text", "text": object()}]
+
+    async def on_read(uri, caller):
+        return [{"uri": uri, "text": object()}]
+
+    frames = [
+        _call(payload={"text": "obj"}, request_id="r-nonser-obj"),
+        _call(payload={"text": "nan"}, request_id="r-nonser-nan"),
+        _read(request_id="r-nonser-read"),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange(frames, service_kwargs={"on_call": on_call, "on_read": on_read}))
+
+    assert replies == [
+        {"type": "error", "request_id": "r-nonser-obj", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+        {"type": "error", "request_id": "r-nonser-nan", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+        {"type": "error", "request_id": "r-nonser-read", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+    ]
+    ends = [r for r in caplog.records if getattr(r, "gw_fields", {}).get("event") == "call.end"]
+    assert len(ends) == 3
+    for end in ends:
+        assert end.gw_fields["outcome"] == "internal"
+        assert end.levelno == logging.ERROR
+
+
+def test_none_mode_plain_json_array_wrapped_in_service_call_and_read():
+    async def on_call(tool, arguments, caller):
+        return [1, 2, 3]
+
+    async def on_read(uri, caller):
+        return [{"id": 1}]
+
+    _, replies = run(_one_exchange(
+        [_call(payload={"text": "x"}, request_id="r-arr-call"),
+         _read(request_id="r-arr-read")],
+        service_kwargs={"on_call": on_call, "on_read": on_read},
+    ))
+    assert replies[0]["type"] == "result"
+    assert replies[0]["payload"] == [{"type": "text", "text": "[1, 2, 3]"}]
+    assert replies[1]["type"] == "result"
+    assert replies[1]["payload"] == [{"uri": "svc://status", "mimeType": "application/json",
+                                      "text": '[{"id": 1}]'}]
+
+
+# --- #52, #54, #56 service resilience & lifecycle tests --------------------------------
+
+def test_deeply_nested_ws_frame_does_not_crash_run():
+    from gateway_client.service import _parse
+    deep_frame = '{"a":' * 10000 + '1' + '}' * 10000
+    assert _parse(deep_frame) is None
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await ws.send(deep_frame)
+            await send_json(ws, _call(payload={"text": "still-alive"}, request_id="r-after-deep"))
+            done.set_result(await recv_json(ws))
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            return await serve_until(make_service(url, issuer=ISSUER), done)
+
+    reply = run(main())
+    assert reply["type"] == "result"
+    assert reply["payload"] == [{"type": "text", "text": "echo:still-alive"}]
+
+
+def test_e2e_deeply_nested_payload_answers_bad_arguments_without_handler_raised(caplog):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(tool)
+        return "ok"
+
+    # ~500-deep dict passes json.loads but triggers jsonschema RecursionError
+    nested = {"text": "leaf"}
+    for _ in range(500):
+        nested = {"nested": nested}
+    frame1, _ = _e2e_call(client, service_key.public_raw, nested, request_id="r-deep-schema")
+
+    # 1500-deep JSON triggers json.loads RecursionError in open_envelope
+    fields = _fields()
+    nonce = e2e.b64url_encode(b"\x03" * 16)
+    sent_at = int(time.time())
+    enc, ctx = e2e._SUITE.create_sender_context(
+        e2e._kem_public(service_key.public_raw), info=e2e.HPKE_INFO, sks=e2e._kem_private(client)
+    )
+    deep_raw = b'{"a":' * 10000 + b"1" + b"}" * 10000
+    ct = ctx.seal(deep_raw, aad=e2e.associated_data(fields, nonce, sent_at))
+    env2 = {
+        "alg": e2e.ALG, "mode": e2e.MODE, "kid": client.kid,
+        "enc": e2e.b64url_encode(enc), "ct": e2e.b64url_encode(ct),
+        "nonce": nonce, "sent_at": sent_at,
+    }
+    frame2 = _call(payload=env2, request_id="r-deep-json", encryption="end-to-end",
+                   client_public_key=client.public_b64, client_kid=client.kid)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame1, frame2], service_kwargs={
+            "key": service_key, "on_call": on_call}))
+    assert [r["code"] for r in replies] == ["bad_arguments", "bad_arguments"]
+    assert called == []
+    assert "handler raised" not in caplog.text
+
+
+def test_unresolvable_ref_schema_answered_internal_without_handler_raised(caplog):
+    from helpers import make_config
+    bad_tools = [{"name": "ref_tool", "description": "d", "inputSchema": {"$ref": "urn:nonexistent"}}]
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(tool)
+        return "ok"
+
+    frame, _ = _e2e_call(client, service_key.public_raw, {"x": 1}, tool="ref_tool", request_id="r-ref")
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await send_json(ws, frame)
+            done.set_result(await recv_json(ws))
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = GatewayService(
+                tools=bad_tools, on_call=on_call,
+                config=make_config(url, key=service_key),
+                jwks_fetch=lambda _u: ISSUER.jwks(),
+            )
+            return await serve_until(svc, done)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        reply = run(main())
+    assert reply["code"] == "internal"
+    assert called == []
+    assert "handler raised" not in caplog.text
+
+
+def test_update_disconnect_during_send_leaves_no_unretrieved_future_exception():
+    import gc
+
+    loop_errors = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _l, ctx: loop_errors.append(ctx))
+        registered = asyncio.Event()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            registered.set()
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = make_service(url, issuer=ISSUER)
+            runner = asyncio.create_task(svc.run())
+            await registered.wait()
+            await svc.wait_registered(5)
+
+            orig_send = svc._send
+
+            async def failing_send(ws, frame):
+                await ws.close()
+                await asyncio.sleep(0.05)  # let _serve exit and _on_disconnected set future exception
+                return await orig_send(ws, frame)
+
+            svc._send = failing_send
+            await svc.update(tools=TOOLS + [{"name": "extra", "description": "d", "inputSchema": {"type": "object"}}])
+            await svc.stop()
+            await asyncio.wait_for(runner, 5.0)
+
+    run(main())
+    gc.collect()
+    assert not [e for e in loop_errors if "Future exception was never retrieved" in str(e.get("message", ""))]
+
+
+def test_rejected_update_then_accepted_update_does_not_poison_normal_close(caplog):
+    from gateway_client import RegistrationRejected
+    from gateway_client.service import _Outcome
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        registered = asyncio.Event()
+        second_update = asyncio.Event()
+        step = 0
+
+        async def handler(ws):
+            nonlocal step
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            registered.set()
+            # First update -> rejected
+            await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "bad_tool"})
+            # Second update -> registered
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            # Consume tools_changed announcement
+            await recv_json(ws)
+            second_update.set()
+            await ws.close(1000, "done")
+
+        async with fake_gateway(handler) as url:
+            svc = make_service(url)
+            attempt_task = asyncio.create_task(svc._attempt())
+            await registered.wait()
+            await svc.wait_registered(5)
+            with pytest.raises(RegistrationRejected):
+                await svc.update(tools=TOOLS + [{"name": "bad", "description": "d", "inputSchema": {"type": "object"}}])
+            await svc.update(tools=TOOLS + [{"name": "good", "description": "d", "inputSchema": {"type": "object"}}])
+            await second_update.wait()
+            outcome = await asyncio.wait_for(attempt_task, 5.0)
+            return outcome
+
+    with caplog.at_level(logging.INFO, logger="gateway_client"):
+        attempt = run(main())
+    assert attempt.outcome is _Outcome.REGISTERED
+
+
+def test_update_with_in_place_mutated_tools_announces_and_rolls_back_cleanly():
+    from gateway_client import RegistrationRejected
+
+    tools = [{"name": "echo", "description": "v1", "inputSchema": {"type": "object"}}]
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+        registered = asyncio.Event()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            registered.set()
+            req1 = await recv_json(ws)
+            await send_json(ws, {"type": "rejected", "reason": "bad_desc"})
+            req2 = await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            announce = await recv_json(ws)
+            done.set_result((req1, req2, announce))
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            from helpers import make_config
+            svc = GatewayService(tools=tools, on_call=default_on_call,
+                                 config=make_config(url), jwks_fetch=lambda _u: ISSUER.jwks())
+            runner = asyncio.create_task(svc.run())
+            await registered.wait()
+            await svc.wait_registered(5)
+            tools[0]["description"] = "v2-rejected"
+            with pytest.raises(RegistrationRejected):
+                await svc.update(tools=tools, announce=True)
+            assert svc._decl.tools[0]["description"] == "v1"
+            tools[0]["description"] = "v3-accepted"
+            await svc.update(tools=tools, announce=True)
+            res = await asyncio.wait_for(done, 5.0)
+            await svc.stop()
+            await asyncio.wait_for(runner, 5.0)
+            return res
+
+    req1, req2, announce = run(main())
+    assert req1["tools"][0]["description"] == "v2-rejected"
+    assert req2["tools"][0]["description"] == "v3-accepted"
+    assert announce == {"type": "tools_changed"}
+
+
+def test_in_flight_calls_see_old_declaration_until_update_registered():
+    async def main():
+        registered = asyncio.Event()
+        update_sent = asyncio.Event()
+        allow_reg = asyncio.Event()
+        seen_during_update = []
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            registered.set()
+            await recv_json(ws)  # update register frame
+            update_sent.set()
+            # Before answering registered, send a call for "other" (in old decl, not in new decl)
+            await send_json(ws, _call(tool="other", payload={}, request_id="r-mid-update"))
+            seen_during_update.append(await recv_json(ws))
+            await allow_reg.wait()
+            await send_json(ws, {"type": "registered"})
+            await recv_json(ws)  # tools_changed
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = make_service(url, issuer=ISSUER)
+            runner = asyncio.create_task(svc.run())
+            await registered.wait()
+            await svc.wait_registered(5)
+            upd_task = asyncio.create_task(svc.update(tools=[TOOLS[0]]))
+            await update_sent.wait()
+            await asyncio.sleep(0.05)
+            allow_reg.set()
+            await asyncio.wait_for(upd_task, 5.0)
+            await svc.stop()
+            await asyncio.wait_for(runner, 5.0)
+            return seen_during_update
+
+    replies = run(main())
+    assert replies[0]["type"] == "result"
+
+
+def test_service_works_across_multiple_asyncio_run_calls():
+    async def do_update(svc):
+        await svc.update(tools=TOOLS + [{"name": "added", "description": "d", "inputSchema": {"type": "object"}}])
+
+    svc = make_service("ws://127.0.0.1:1/backend")
+    asyncio.run(do_update(svc))
+
+    async def run_with_gw():
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc.config = Config(
+                url=url, service_name=svc.config.service_name,
+                credential=svc.config.credential, key=svc.config.key,
+            )
+            runner = asyncio.create_task(svc.run())
+            await svc.wait_registered(5.0)
+            await svc.stop()
+            await asyncio.wait_for(runner, 5.0)
+
+    asyncio.run(run_with_gw())
+    asyncio.run(run_with_gw())
+
+
+def test_stop_interrupts_stalled_connect_promptly():
+    async def main():
+        accepted = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blackhole(reader, writer):
+            accepted.set()
+            try:
+                await release.wait()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        srv = await asyncio.start_server(blackhole, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        try:
+            svc = make_service(f"ws://127.0.0.1:{port}/backend")
+            svc._reply_timeout = 30.0
+            runner = asyncio.create_task(svc.run())
+            await asyncio.wait_for(accepted.wait(), 5.0)
+            t0 = time.monotonic()
+            await svc.stop()
+            await asyncio.wait_for(runner, 1.0)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 0.5
+        finally:
+            release.set()
+            srv.close()
+            await srv.wait_closed()
+
+    run(main())
+
+
+def test_stop_before_run_returns_immediately_without_connecting():
+    connected = []
+
+    async def main():
+        async def handler(ws):
+            connected.append(True)
+            await ws.close()
+
+        async with fake_gateway(handler) as url:
+            svc = make_service(url)
+            await svc.stop()
+            await asyncio.wait_for(svc.run(), 1.0)
+
+    run(main())
+    assert connected == []
 
 

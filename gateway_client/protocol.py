@@ -13,21 +13,44 @@ without them is unchanged). Version 2 has no `roles` or
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+import jsonschema
+
 CONTRACT_VERSION = 2
 
 RETRY_CAP_SECONDS = 30.0      # backoff cap after a dropped connection
 REJECTED_CAP_SECONDS = 300.0  # backoff cap after `rejected`
 BASE_DELAY_SECONDS = 1.0
+# The gateway closes a connection with this code when a newer registration of
+# the same service replaced it (e.g. a deploy running old and new side by
+# side). Reconnecting at once would supersede the new instance back.
+SUPERSEDED_CLOSE_CODE = 4001
 
 
 def _nonempty_str(value: Any) -> bool:
-    return isinstance(value, str) and bool(value)
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
+def _check_json_serializable(label: str, value: Any) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be RFC 8259 JSON-serializable: {exc}") from None
+
+
+def _reject_nonfinite(token: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {token!r} is not allowed")
+
+
+def loads_strict(raw: str | bytes) -> Any:
+    """Parse RFC 8259 JSON, rejecting NaN, Infinity, and -Infinity."""
+    return json.loads(raw, parse_constant=_reject_nonfinite)
 
 
 ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
@@ -132,13 +155,21 @@ class Declaration:
               service: str | None = None) -> "Declaration":
         """`service` is the service's name; it is needed (to check the
         `<service>_` prefix) only when there are prompts."""
-        tools, resources, prompts = list(tools), list(resources), list(prompts)
+        tools = [copy.deepcopy(t) for t in tools]
+        resources = [copy.deepcopy(r) for r in resources]
+        prompts = [copy.deepcopy(p) for p in prompts]
         tool_names: set[str] = set()
         for i, tool in enumerate(tools):
             if not (isinstance(tool, dict) and _nonempty_str(tool.get("name"))
                     and isinstance(tool.get("description"), str)
                     and isinstance(tool.get("inputSchema"), dict)):
                 raise ValueError(f"tools[{i}] needs name, description and inputSchema")
+            _check_json_serializable(f"tools[{i}]", tool)
+            try:
+                validator = jsonschema.validators.validator_for(tool["inputSchema"])
+                validator.check_schema(tool["inputSchema"])
+            except (jsonschema.SchemaError, TypeError, ValueError) as exc:
+                raise ValueError(f"tools[{i}] inputSchema is invalid: {exc}") from None
             if "annotations" in tool:
                 _check_annotations(i, tool["annotations"])
             if tool["name"] in tool_names:
@@ -151,6 +182,7 @@ class Declaration:
                     and isinstance(res.get("mimeType"), str)
                     and isinstance(res.get("description"), str)):
                 raise ValueError(f"resources[{i}] needs uri, name, mimeType and description")
+            _check_json_serializable(f"resources[{i}]", res)
             if res["uri"] in uris:
                 raise ValueError(f"resource {res['uri']!r} declared twice")
             uris.add(res["uri"])
@@ -159,6 +191,7 @@ class Declaration:
         prompt_names: set[str] = set()
         for i, prompt in enumerate(prompts):
             _check_prompt(i, prompt, prompt_prefix(service or ""))
+            _check_json_serializable(f"prompts[{i}]", prompt)
             if prompt["name"] in prompt_names:
                 raise ValueError(f"prompt {prompt['name']!r} declared twice")
             prompt_names.add(prompt["name"])
@@ -223,20 +256,44 @@ class ToolResult:
         return False
 
 
-def content_blocks(value: Any) -> list[Any]:
-    """A handler's tool result as MCP content blocks: a list is kept, a
-    string becomes one text block, anything else one text block of its JSON.
-    If given a ToolResult or a dict with isError/is_error and content,
-    extracts the inner content."""
-    if isinstance(value, ToolResult):
-        return content_blocks(value.content)
-    if isinstance(value, dict) and ("isError" in value or "is_error" in value) and "content" in value:
-        return content_blocks(value["content"])
-    if isinstance(value, list):
+def _is_mcp_content_list(value: list[Any]) -> bool:
+    return all(isinstance(item, dict) and isinstance(item.get("type"), str) and bool(item["type"])
+               for item in value)
+
+
+def _is_mcp_resource_list(value: list[Any]) -> bool:
+    return all(isinstance(item, dict) and isinstance(item.get("uri"), str)
+               and ("text" in item or "blob" in item) for item in value)
+
+
+def _is_tool_result_dict(value: Any) -> bool:
+    if not isinstance(value, dict) or "content" not in value:
+        return False
+    keys = set(value)
+    if not (keys <= {"content", "isError", "is_error"}):
+        return False
+    err_keys = keys & {"isError", "is_error"}
+    return bool(err_keys) and all(isinstance(value[k], bool) for k in err_keys)
+
+
+def _format_content(value: Any) -> list[Any]:
+    if isinstance(value, list) and _is_mcp_content_list(value):
         return value
     if isinstance(value, str):
         return [{"type": "text", "text": value}]
-    return [{"type": "text", "text": json.dumps(value, default=str)}]
+    return [{"type": "text", "text": json.dumps(value, default=str, allow_nan=False)}]
+
+
+def content_blocks(value: Any) -> list[Any]:
+    """A handler's tool result as MCP content blocks: a list of MCP content
+    block dicts is kept, a string becomes one text block, anything else one
+    text block of its JSON. If given a ToolResult or a dict with only
+    `content` and boolean `isError`/`is_error`, extracts the inner content."""
+    if isinstance(value, ToolResult):
+        return _format_content(value.content)
+    if _is_tool_result_dict(value):
+        return _format_content(value["content"])
+    return _format_content(value)
 
 
 def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
@@ -244,29 +301,29 @@ def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
 
     Accepts:
     - ToolResult instance
-    - dict with "isError" or "is_error"
-    - list of content blocks
+    - dict with "content" and boolean "isError" or "is_error" (no extra keys)
+    - list of MCP content blocks
     - string
     - any JSON-serializable value
     """
     if isinstance(value, ToolResult):
-        return content_blocks(value.content), value.is_error
-    if isinstance(value, dict) and ("isError" in value or "is_error" in value):
-        is_error = bool(value.get("isError") if "isError" in value else value.get("is_error"))
-        raw = value["content"] if "content" in value else value
-        return content_blocks(raw), is_error
-    return content_blocks(value), False
+        return _format_content(value.content), value.is_error
+    if _is_tool_result_dict(value):
+        is_error = value["isError"] if "isError" in value else value["is_error"]
+        return _format_content(value["content"]), is_error
+    return _format_content(value), False
 
 
 def resource_contents(value: Any, uri: str, mime_type: str) -> list[Any]:
-    """A handler's resource read as MCP contents: a list is kept, a string
-    becomes one text content, anything else one text content of its JSON."""
-    if isinstance(value, list):
+    """A handler's resource read as MCP contents: a list of MCP resource
+    content dicts is kept, a string becomes one text content, anything else
+    one text content of its JSON."""
+    if isinstance(value, list) and _is_mcp_resource_list(value):
         return value
     if isinstance(value, str):
         return [{"uri": uri, "mimeType": mime_type, "text": value}]
     return [{"uri": uri, "mimeType": "application/json",
-             "text": json.dumps(value, default=str)}]
+             "text": json.dumps(value, default=str, allow_nan=False)}]
 
 
 # --- backoff ----------------------------------------------------------------------
@@ -290,3 +347,9 @@ class Backoff:
         step = min(self._step, cap)
         self._step = min(step * 2, cap)
         return step * (0.5 + self._rand() / 2)
+
+    def superseded_delay(self) -> float:
+        """The wait after the gateway closed a registered connection as
+        superseded (`SUPERSEDED_CLOSE_CODE`): `RETRY_CAP_SECONDS`, with the
+        same jitter. The step is left as is."""
+        return RETRY_CAP_SECONDS * (0.5 + self._rand() / 2)

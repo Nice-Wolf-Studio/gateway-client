@@ -7,7 +7,7 @@ This file provides load-bearing working notes and operational guidelines for AI 
 ## 1. Branch Model & GitHub Rulesets
 
 - **`development` is the active integration branch.** All feature branches, bugfixes, and refactors branch from `origin/development` and open PRs targeting `development`.
-- **`main` is production and the default GitHub branch.** 
+- **`main` is the release branch and the default GitHub branch.** Merging it ships nothing (see "Deploying through wolf-pack").
   - `development` is promoted to `main` at release milestones via a promotion PR (`development → main`).
   - Promotion PRs merge with a merge commit (`gh pr merge <num> --merge`), not squash, preserving individual commit history between branches.
 - **GitHub Rulesets (`platform-main` and `platform-development`):**
@@ -34,27 +34,28 @@ This file provides load-bearing working notes and operational guidelines for AI 
 
 ### 3.1. Contract v2 Verification & Check Order
 When a frame arrives, `GatewayService._reply` enforces this strict precedence:
-1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control) or `Cf` (format) characters. Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent). The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
+1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control), `Cf` (format), or `Zl`/`Zp` (line/paragraph separator) characters. `exp` must be finite (`NaN`/`Infinity`/`-Infinity` are refused). Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
 2. **`encryption` mode check** (`none` or `end-to-end`) → invalid yields `bad_arguments`.
-3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning.
-4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found`.
+3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning. For non-empty string targets, the AAD `fields` header is constructed immediately so subsequent `not_found` errors are sealed (AC 23).
+4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found` (sealed in `end-to-end` mode when `target` is a non-empty string).
 5. **Payload handling & downgrade pinning**:
-   - Connected apps (`caller.app` / `act` WRN) seen in `end-to-end` mode are recorded in `self._pinned`.
+   - In `end-to-end` `call` mode, `e2e.open_envelope` authenticates the envelope before `caller.app` is added to `self._pinned` (preventing unauthenticated lockout on malformed/unauthenticated envelopes).
+   - Connected apps (`caller.app` / `act` WRN) seen in authenticated `end-to-end` calls (or valid E2E `read_resource` frames) are recorded in `self._pinned`.
    - Subsequent `none` calls from a pinned app are refused with `not_allowed`.
 
 ### 3.2. Statelessness & Pin Persistence (Q2 / D2)
 - **Stateless by default**: In-memory pinning (`self._pinned: set[str] = set()`) is the default, maintaining zero file side effects and preventing permanent lockouts if an operator toggles an app's encryption in `mcp-gateway`.
-- **Opt-in persistence**: Set `SERVICE_PIN_STORE_FILE` in environment or pass `pin_store=FilePinStore(path)` to `GatewayService`. `FilePinStore` uses atomic file replacement (`mkstemp` + `fsync` + `os.replace`) with `0600` permissions.
+- **Opt-in persistence**: Set `SERVICE_PIN_STORE_FILE` in environment or pass `pin_store=FilePinStore(path)` to `GatewayService`. `FilePinStore` fails closed on unreadable/corrupt pin files or directory paths, tracks `(st_mtime_ns, st_size, st_ino)` for external reloads, and uses thread-safe atomic file replacement (`mkstemp` + `fsync` + `os.replace`) with `0600` permissions.
 
 ### 3.3. Strict Privacy & Metadata-Only Logging Invariant
 - **Never logged**: arguments, results, error text from handlers, `SERVICE_CREDENTIAL`, `SERVICE_PRIVATE_KEY`, or `Caller.token` (the raw JWT).
 - **No heuristic redaction**: zero key-name pattern matching or partial masking.
-- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r` → `\r`, `\n` → `\n`).
-- **Structured call tracing**: routed requests emit `call.start` and `call.end` events capturing `request_id`, `tool`/`uri`, `principal`, `app`, `duration_ms`, and `outcome`. Setting `GATEWAY_LOG_FORMAT=json` outputs structured JSON logs.
+- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r`, `\n`, `\t`, and all `Cc`/`Cf`/`Zl`/`Zp` characters), and `_kv_value` quotes empty strings or values containing whitespace, `=`, or `"` as JSON strings; `to_json` escapes `\u2028`, `\u2029`, and `\x85` so JSONL records remain single-line under `str.splitlines()`.
+- **Structured call tracing**: routed requests emit `call.start` and `call.end` events capturing `request_id`, `tool`/`uri`, `principal`, `app`, `duration_ms`, and `outcome` (including `outcome="cancelled"` when an in-flight handler is cancelled). Setting `GATEWAY_LOG_FORMAT=json` outputs structured JSON logs.
 - **Context helper**: `current_request_id()` returns the active request ID inside handlers across async boundaries, and `None` outside.
 
 ### 3.4. Application Tool Errors (`isError=True`)
-- Handlers can return `ToolResult(content=..., isError=True)` or a mapping with `{"isError": True, "content": [...]}`.
+- Handlers can return `ToolResult(content=..., isError=True)` or a dict whose keys are a subset of `{"content", "isError", "is_error"}` with `"content"` present and a boolean error flag. Plain domain dicts with `"is_error"`/`"isError"` and extra keys (or missing `"content"`) are serialized intact as normal tool results. Plain JSON lists (whose elements are not MCP content blocks) are wrapped into a single text block / JSON resource content entry.
 - In `none` mode, the frame carries `"is_error": True`.
 - In `end-to-end` mode, `"is_error": True` is authenticated within the HPKE envelope associated data (`associated_data` / `reply_header`), ensuring tampering fails AEAD decryption.
 - The outcome is traced as `outcome="tool_error"`.
@@ -92,3 +93,7 @@ Driver constraints (`tests/gateway_e2e_driver.py`):
   for t in $(git tag -l 'v*'); do git show "$t:pyproject.toml" | grep -q "version = \"${t#v}\"" || echo "Mismatch on $t"; done
   ```
 - Always update `CHANGELOG.md` with release notes before tagging.
+
+## Deploying through wolf-pack
+
+Production deploys only from [`Nice-Wolf-Studio/wolf-pack`](https://github.com/Nice-Wolf-Studio/wolf-pack). This library is not deployed on its own, so merging here, to `development` or `main`, ships nothing. It reaches production only inside a service: bump the pin in the consuming service, merge that, pin the service's commit in wolf-pack (`python tools/pack.py pin <path> <commit>`), open a wolf-pack PR to `development` with a cross-family review, merge it, promote wolf-pack `development` to `main`, and deploy through wolf-pack ([wolf-infra ADR 0005](https://github.com/Nice-Wolf-Studio/wolf-infra/blob/development/docs/adr/0005-wolf-pack-manifest-repository.md)).

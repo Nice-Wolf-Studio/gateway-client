@@ -439,3 +439,40 @@ def test_secrets_and_tokens_never_logged_at_any_level(caplog):
     assert "r-secret-test" in all_logs
     assert PRINCIPAL in all_logs
     assert APP in all_logs
+
+
+def test_cancelled_in_flight_handler_emits_call_end_cancelled(caplog):
+    started = asyncio.Event()
+
+    async def on_call(tool, arguments, caller):
+        started.set()
+        await asyncio.sleep(10)
+        return "never"
+
+    async def main():
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await send_json(ws, _call(payload={"text": "hi"}, request_id="r-cancel-1"))
+            await started.wait()
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = make_service(url, on_call=on_call, issuer=ISSUER)
+            runner = asyncio.create_task(svc.run())
+            await started.wait()
+            # Trigger _drain directly with short grace so handler task is cancelled
+            await svc._drain(grace=0.01)
+            await svc.stop()
+            await asyncio.wait_for(runner, 5.0)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        run(main())
+
+    starts = _events(caplog, "call.start")
+    ends = _events(caplog, "call.end")
+    assert len(starts) == 1
+    assert len(ends) == 1
+    assert ends[0]["request_id"] == "r-cancel-1"
+    assert ends[0]["outcome"] == "cancelled"
+    assert isinstance(ends[0]["duration_ms"], (int, float))

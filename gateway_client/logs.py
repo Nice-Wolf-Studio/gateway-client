@@ -29,11 +29,14 @@ import json
 import logging
 import os
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Iterator, Mapping
 
 LOG_FORMAT_ENV = "GATEWAY_LOG_FORMAT"
 TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+_FORBIDDEN_LOG_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp"))
+_CHAR_ESCAPES = {"\r": "\\r", "\n": "\\n", "\t": "\\t"}
 
 _request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "gateway_client_request_id", default=None
@@ -41,18 +44,33 @@ _request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 
 def _safe_str(val: Any) -> str:
-    """Format `val` for log lines, escaping CR and LF to prevent log forging."""
+    """Format `val` for log lines, escaping line separators and control/format characters."""
     if val is None:
         return "None"
     s = val if isinstance(val, str) else str(val)
-    return s.replace("\r", "\\r").replace("\n", "\\n")
+    if not any(unicodedata.category(ch) in _FORBIDDEN_LOG_CATEGORIES for ch in s):
+        return s
+    out = []
+    for ch in s:
+        if ch in _CHAR_ESCAPES:
+            out.append(_CHAR_ESCAPES[ch])
+        elif unicodedata.category(ch) in _FORBIDDEN_LOG_CATEGORIES:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 # --- serialization -----------------------------------------------------------
 
 def to_json(value: Any) -> str:
     """Compact JSON; anything not JSON-native is stringified."""
-    return json.dumps(value, default=str, ensure_ascii=False, separators=(",", ":"))
+    raw = json.dumps(value, default=str, ensure_ascii=False, separators=(",", ":"))
+    return (
+        raw.replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+        .replace("\x85", "\\u0085")
+    )
 
 
 # --- request id --------------------------------------------------------------
@@ -85,7 +103,12 @@ class RequestIdFilter(logging.Filter):
 # --- formatting --------------------------------------------------------------
 
 def _kv_value(value: Any) -> str:
-    return _safe_str(value if isinstance(value, str) else to_json(value))
+    if isinstance(value, str):
+        safe = _safe_str(value)
+        if not safe or any(ch.isspace() or ch in '="' for ch in safe):
+            return to_json(value)
+        return safe
+    return _safe_str(to_json(value))
 
 
 def text_line(message: str, fields: Mapping[str, Any]) -> str:
@@ -125,11 +148,12 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         fields = getattr(record, "gw_fields", None)
+        gw_message = getattr(record, "gw_message", None)
         out: dict[str, Any] = {
             "timestamp": _iso_utc(record.created),
             "level": record.levelname,
             "logger": record.name,
-            "message": getattr(record, "gw_message", None) or record.getMessage(),
+            "message": gw_message if gw_message is not None else record.getMessage(),
         }
         if fields:
             out.update(fields)

@@ -211,3 +211,41 @@ def test_apply_env_format_on_existing_root_handlers(monkeypatch, env_json):
     finally:
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
+
+
+@pytest.mark.parametrize("sep", ["\r", "\n", "\x85", "\u2028", "\u2029", "\x00", "\u200b"])
+def test_json_formatter_single_line_and_exact_roundtrip(sep):
+    fields = {
+        "event": "call.start",
+        "request_id": f"r1{sep}forged",
+        "target": f"echo{sep}t",
+        "encryption": f"none{sep}e",
+    }
+    rec = _record(msg=f"msg{sep}x", fields=fields)
+    formatted = JsonFormatter().format(rec)
+    assert len(formatted.splitlines()) == 1
+    parsed = json.loads(formatted)
+    assert parsed["request_id"] == fields["request_id"]
+    assert parsed["target"] == fields["target"]
+    assert parsed["encryption"] == fields["encryption"]
+
+
+@pytest.mark.parametrize("sep", ["\r", "\n", "\x85", "\u2028", "\u2029", "\x00", "\x0b", "\x0c", "\x7f", "\u200b"])
+def test_text_line_and_safe_str_prevent_multiline_splitting(sep):
+    line = text_line("call.start", {"event": "call.start", "request_id": f"r1{sep}forged"})
+    assert len(line.splitlines()) == 1
+    assert sep not in line
+
+
+def test_text_line_quotes_spaces_equals_and_empty_strings():
+    line = text_line("call.start", {"event": "call.start", "request_id": "r1 outcome=result", "tool": "echo", "empty": ""})
+    assert 'request_id="r1 outcome=result"' in line
+    assert "tool=echo" in line
+    assert 'empty=""' in line
+
+
+def test_json_formatter_preserves_explicit_empty_gw_message():
+    rec = logging.LogRecord("gateway_client", logging.INFO, __file__, 1, "fallback", None, None)
+    rec.gw_message = ""
+    out = json.loads(JsonFormatter().format(rec))
+    assert out["message"] == ""
