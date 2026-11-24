@@ -69,6 +69,7 @@ from pyhpke import AEADId, CipherSuite, KDFId, KEMId, KEMKey
 from pyhpke.exceptions import PyHPKEError
 
 from .errors import BAD_ARGUMENTS, NOT_ALLOWED
+from .protocol import loads_strict
 
 ENCRYPTION_E2E = "end-to-end"
 ENCRYPTION_NONE = "none"
@@ -121,7 +122,7 @@ def b64url_decode(text: Any, field: str = "value") -> bytes:
 def canonical_json(value: Any) -> bytes:
     """UTF-8 JSON, keys sorted, no spaces (the associated-data form)."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False).encode("utf-8")
+                      ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def key_id(public_key_raw: bytes) -> str:
@@ -327,6 +328,6 @@ def open_envelope(envelope: Any, *, recipient: KeyPair, sender_public_raw: bytes
     if replay is not None and not replay.claim(replay_client_id or "", envelope["nonce"], clock):
         raise E2EError(NOT_ALLOWED, "envelope nonce was already used")
     try:
-        return json.loads(plaintext.decode("utf-8"))
+        return loads_strict(plaintext.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise E2EError(BAD_ARGUMENTS, "envelope plaintext is not UTF-8 JSON") from None

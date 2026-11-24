@@ -164,3 +164,35 @@ def test_check_public_key_accepts_valid():
     pair = KeyPair.generate()
     # Does not raise
     e2e.check_public_key(pair.public_raw)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_open_envelope_rejects_nonfinite_json_constants(constant):
+    client, service = _pair()
+    nonce = e2e.b64url_encode(b"\x01" * 16)
+    sent_at = int(NOW)
+    fields = _fields()
+    enc, ctx = e2e._SUITE.create_sender_context(
+        e2e._kem_public(service.public_raw), info=e2e.HPKE_INFO, sks=e2e._kem_private(client)
+    )
+    ct = ctx.seal(f'{{"amount": {constant}}}'.encode("utf-8"),
+                  aad=e2e.associated_data(fields, nonce, sent_at))
+    env = {
+        "alg": e2e.ALG, "mode": e2e.MODE, "kid": client.kid,
+        "enc": e2e.b64url_encode(enc), "ct": e2e.b64url_encode(ct),
+        "nonce": nonce, "sent_at": sent_at,
+    }
+    with pytest.raises(E2EError) as exc:
+        e2e.open_envelope(env, recipient=service, sender_public_raw=client.public_raw,
+                          fields=fields, now=sent_at)
+    assert exc.value.code == "bad_arguments"
+
+
+@pytest.mark.parametrize("bad_val", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_and_seal_reject_nonfinite_floats(bad_val):
+    client, service = _pair()
+    with pytest.raises(ValueError):
+        e2e.canonical_json({"x": bad_val})
+    with pytest.raises(ValueError):
+        e2e.seal({"x": bad_val}, sender=client, recipient_public_raw=service.public_raw,
+                 fields=_fields(), now=NOW)

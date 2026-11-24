@@ -34,7 +34,7 @@ This file provides load-bearing working notes and operational guidelines for AI 
 
 ### 3.1. Contract v2 Verification & Check Order
 When a frame arrives, `GatewayService._reply` enforces this strict precedence:
-1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control) or `Cf` (format) characters. Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent). The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
+1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control), `Cf` (format), or `Zl`/`Zp` (line/paragraph separator) characters. `exp` must be finite (`NaN`/`Infinity`/`-Infinity` are refused). Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
 2. **`encryption` mode check** (`none` or `end-to-end`) → invalid yields `bad_arguments`.
 3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning.
 4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found`.
@@ -49,7 +49,7 @@ When a frame arrives, `GatewayService._reply` enforces this strict precedence:
 ### 3.3. Strict Privacy & Metadata-Only Logging Invariant
 - **Never logged**: arguments, results, error text from handlers, `SERVICE_CREDENTIAL`, `SERVICE_PRIVATE_KEY`, or `Caller.token` (the raw JWT).
 - **No heuristic redaction**: zero key-name pattern matching or partial masking.
-- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r` → `\r`, `\n` → `\n`).
+- **Log injection protection**: all untrusted strings formatted into plain-text logs are escaped using `_safe_str` (`\r`, `\n`, `\t`, and all `Cc`/`Cf`/`Zl`/`Zp` characters); `to_json` escapes `\u2028`, `\u2029`, and `\x85` so JSONL records remain single-line under `str.splitlines()`.
 - **Structured call tracing**: routed requests emit `call.start` and `call.end` events capturing `request_id`, `tool`/`uri`, `principal`, `app`, `duration_ms`, and `outcome`. Setting `GATEWAY_LOG_FORMAT=json` outputs structured JSON logs.
 - **Context helper**: `current_request_id()` returns the active request ID inside handlers across async boundaries, and `None` outside.
 

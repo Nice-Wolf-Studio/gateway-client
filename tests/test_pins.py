@@ -85,3 +85,35 @@ def test_file_pin_store_reloads_on_external_change(tmp_path: Path):
     path.write_text("wrn:access:client/ext\n# comment\n\n", encoding="utf-8")
     assert "wrn:access:client/ext" in store
     assert len(store) == 1
+
+
+@pytest.mark.parametrize("bad_pin", [
+    "wrn:app1\u2028wrn:app2",
+    "wrn:app1\u2029wrn:app2",
+    "wrn:app1\x85wrn:app2",
+    "wrn:app1\vwrn:app2",
+    "wrn:app1\fwrn:app2",
+    "wrn:app1\x1cwrn:app2",
+    " wrn:app1",
+    "wrn:app1 ",
+    "#wrn:app1",
+    "wrn:app1\u200b",
+])
+def test_file_pin_store_rejects_line_separators_whitespace_and_hash_prefix(tmp_path: Path, bad_pin: str):
+    path = tmp_path / "pins.txt"
+    store = FilePinStore(path)
+    with pytest.raises(ValueError):
+        store.add(bad_pin)
+    assert bad_pin not in store
+    assert len(FilePinStore(path)) == 0
+
+
+def test_file_pin_store_round_trip_and_discard_exact(tmp_path: Path):
+    path = tmp_path / "pins.txt"
+    store = FilePinStore(path)
+    val = "wrn:access:client/app with space"
+    store.add(val)
+    assert val in store
+    assert val in FilePinStore(path)
+    store.discard(f" {val} ")
+    assert val in store

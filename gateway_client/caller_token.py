@@ -17,13 +17,15 @@ the first failure:
 
 1. the token is a compact JWS whose header names `alg: EdDSA` and a valid
    `kid` (a non-blank string with no leading or trailing whitespace and no
-   Unicode `Cc` control or `Cf` format characters);
+   Unicode `Cc` control, `Cf` format, or `Zl`/`Zp` line/paragraph separator
+   characters);
 2. `kid` is a key in the key set (`KeySet`; an unknown kid triggers one
    rate-limited refetch, for a gateway that rotated its key);
 3. the signature verifies under that key;
 4. `sub`, `act`, `aud`, `exp` and `jti` are present; `sub`, `act` and `jti`
    are non-blank strings with no leading or trailing whitespace and no
-   Unicode `Cc` (control) or `Cf` (format) characters, kept as-is without
+   Unicode `Cc` (control), `Cf` (format), or `Zl`/`Zp` (line/paragraph
+   separator) characters, kept as-is without
    normalization; `aud` is a string equal to this service's name (a list is
    refused even when it names the service: the token is for one backend);
    When `agent` is present it is held to the same string rule and must be a
@@ -52,9 +54,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
+import math
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -64,6 +67,7 @@ from urllib.parse import urlsplit, urlunsplit
 import jwt
 
 from .errors import NOT_ALLOWED, UNAVAILABLE
+from .protocol import loads_strict
 
 ALGORITHM = "EdDSA"
 REQUIRED_CLAIMS = ("sub", "act", "aud", "exp", "jti")
@@ -114,14 +118,29 @@ def jwks_url_for(backend_url: str) -> str:
     return urlunsplit((scheme, parts.netloc, path + JWKS_PATH, "", ""))
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects so fetch_jwks never follows https->http downgrades
+    or redirects to non-HTTP schemes / other origins."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        if fp is not None:
+            fp.close()
+        raise urllib.error.URLError(f"JWKS endpoint must not redirect (HTTP {code})")
+
+
+_JWKS_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def fetch_jwks(url: str) -> dict:
     """GET `url` and parse it as JSON (blocking; run in a worker thread)."""
+    if urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError("JWKS URL must use http:// or https://")
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as response:  # noqa: S310
+    with _JWKS_OPENER.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
         body = response.read(MAX_JWKS_BYTES + 1)
     if len(body) > MAX_JWKS_BYTES:
         raise ValueError("key set is too large")
-    return json.loads(body)
+    return loads_strict(body)
 
 
 def _ed25519_keys(document: Any) -> dict[str, jwt.PyJWK]:
@@ -193,14 +212,17 @@ class KeySet:
                 return self._last_outcome
             if not self._may_fetch():
                 return SKIPPED
-            self._attempted_at = self._clock()
-            self._generation += 1
+            started_at = self._clock()
             try:
                 keys = _ed25519_keys(await self._call_fetch())
             except Exception:  # network, JSON or shape: keep what is cached
+                self._attempted_at = started_at
+                self._generation += 1
                 self._last_outcome = FAILED
                 return FAILED
-            self._keys, self._loaded_at = keys, self._attempted_at
+            self._attempted_at = started_at
+            self._generation += 1
+            self._keys, self._loaded_at = keys, started_at
             self._last_outcome = FETCHED
             return FETCHED
 
@@ -219,12 +241,12 @@ class KeySet:
             outcome = await self._refresh()
             if kid in self._keys:
                 return self._keys[kid]
-        if outcome == FAILED:
+        if outcome == FAILED or (outcome == SKIPPED and self._last_outcome == FAILED):
             raise TokenRefused("the gateway key set could not be fetched", UNAVAILABLE)
         raise TokenRefused("kid is not in the gateway key set")
 
 
-_FORBIDDEN_CATEGORIES = frozenset(("Cc", "Cf"))
+_FORBIDDEN_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp"))
 
 
 AGENT_WRN_PREFIX = "wrn:access:agent/"
@@ -242,8 +264,9 @@ def _check_agent(value: Any) -> str:
 def _check_id_str(label: str, value: Any) -> str:
     """Validate a caller-identity or key-id string (`sub`, `act`, `jti`,
     header `kid`): a non-blank `str` with no leading or trailing whitespace
-    and no Unicode control (`Cc`) or format (`Cf`) characters. Never
-    normalizes; returns `value` unchanged or raises `TokenRefused`."""
+    and no Unicode control (`Cc`), format (`Cf`), or line/paragraph separator
+    (`Zl`, `Zp`) characters. Never normalizes; returns `value` unchanged or
+    raises `TokenRefused`."""
     if not isinstance(value, str) or not value:
         raise TokenRefused(f"{label} is not a non-blank string")
     if value[0].isspace() or value[-1].isspace():
@@ -332,8 +355,8 @@ class CallerTokenVerifier:
         if "agent" in claims:
             _check_agent(claims["agent"])
         exp = claims.get("exp")
-        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
-            raise TokenRefused("caller_token exp is not a number")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+            raise TokenRefused("caller_token exp is not a finite number")
         if exp + self._leeway < now:
             raise TokenRefused("caller_token has expired")
         if exp - now > MAX_TTL_SECONDS + self._leeway:

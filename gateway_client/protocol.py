@@ -30,6 +30,15 @@ def _nonempty_str(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _reject_nonfinite(token: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {token!r} is not allowed")
+
+
+def loads_strict(raw: str | bytes) -> Any:
+    """Parse RFC 8259 JSON, rejecting NaN, Infinity, and -Infinity."""
+    return json.loads(raw, parse_constant=_reject_nonfinite)
+
+
 ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 
@@ -236,7 +245,7 @@ def content_blocks(value: Any) -> list[Any]:
         return value
     if isinstance(value, str):
         return [{"type": "text", "text": value}]
-    return [{"type": "text", "text": json.dumps(value, default=str)}]
+    return [{"type": "text", "text": json.dumps(value, default=str, allow_nan=False)}]
 
 
 def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
@@ -266,7 +275,7 @@ def resource_contents(value: Any, uri: str, mime_type: str) -> list[Any]:
     if isinstance(value, str):
         return [{"uri": uri, "mimeType": mime_type, "text": value}]
     return [{"uri": uri, "mimeType": "application/json",
-             "text": json.dumps(value, default=str)}]
+             "text": json.dumps(value, default=str, allow_nan=False)}]
 
 
 # --- backoff ----------------------------------------------------------------------

@@ -5,8 +5,11 @@ from __future__ import annotations
 import collections.abc
 import os
 import tempfile
+import unicodedata
 from collections.abc import Iterator, MutableSet
 from pathlib import Path
+
+_FORBIDDEN_PIN_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp"))
 
 
 class FilePinStore(MutableSet[str]):
@@ -40,7 +43,7 @@ class FilePinStore(MutableSet[str]):
             return
         self._apps = {
             line.strip()
-            for line in text.splitlines()
+            for line in text.split("\n")
             if line.strip() and not line.strip().startswith("#")
         }
         try:
@@ -89,11 +92,14 @@ class FilePinStore(MutableSet[str]):
     def add(self, value: str) -> None:
         if not isinstance(value, str):
             raise TypeError(f"expected str, got {type(value).__name__}")
-        if "\n" in value or "\r" in value:
-            raise ValueError("pin value cannot contain newlines")
-        value = value.strip()
-        if not value:
+        if not value or not value.strip():
             raise ValueError("pin value cannot be empty")
+        if value[0].isspace() or value[-1].isspace():
+            raise ValueError("pin value cannot have leading or trailing whitespace")
+        if value.startswith("#"):
+            raise ValueError("pin value cannot start with '#'")
+        if any(unicodedata.category(ch) in _FORBIDDEN_PIN_CATEGORIES for ch in value):
+            raise ValueError("pin value cannot contain newlines or control characters")
         self._reload_if_changed()
         if value not in self._apps:
             self._apps.add(value)
@@ -102,7 +108,6 @@ class FilePinStore(MutableSet[str]):
     def discard(self, value: str) -> None:
         if not isinstance(value, str):
             return
-        value = value.strip()
         self._reload_if_changed()
         if value in self._apps:
             self._apps.discard(value)
