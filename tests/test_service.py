@@ -1922,3 +1922,167 @@ def test_e2e_call_success_fails_if_opened_as_error():
                            fields=e2e.reply_header(fields, reply["request_id"], is_error=True))
 
 
+# --- #43, #47, #48 service integration tests -----------------------------------------
+
+@pytest.mark.parametrize("kind", ["call", "read_resource"])
+def test_service_refuses_nan_exp_token_before_handler_and_logs_once(kind, caplog):
+    import json as _json
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(tool)
+        return "ok"
+
+    async def on_read(uri, caller):
+        called.append(uri)
+        return "ok"
+
+    hdr = e2e.b64url_encode(_json.dumps({"alg": "EdDSA", "kid": ISSUER.kid}).encode())
+    now_i = int(time.time())
+    body = e2e.b64url_encode(
+        f'{{"sub":"{PRINCIPAL}","act":"{APP}","aud":"svc","iat":{now_i},"exp":NaN,"jti":"j-svc-nan-{kind}"}}'.encode()
+    )
+    sig = e2e.b64url_encode(ISSUER._key.sign(f"{hdr}.{body}".encode()))
+    tok = f"{hdr}.{body}.{sig}"
+
+    frame = (_call(payload={"text": "x"}, token=tok, request_id="r-nan-call") if kind == "call"
+             else _read(token=tok, request_id="r-nan-read"))
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange([frame], service_kwargs={"on_call": on_call, "on_read": on_read}))
+    assert replies == [{"type": "error", "request_id": frame["request_id"],
+                        "encryption": "none", "code": "not_allowed", "payload": TOKEN_REFUSED}]
+    assert called == []
+    warnings = [r for r in caplog.records
+                if r.name.startswith("gateway_client") and r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert tok not in caplog.text
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_e2e_call_with_nonfinite_json_answered_bad_arguments_before_on_call(constant):
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+    called = []
+
+    async def on_call(tool, arguments, caller):
+        called.append(arguments)
+        return "ok"
+
+    bounded_tools = [{
+        "name": "pay", "description": "Pay.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"amount": {"type": "number", "minimum": 0, "maximum": 100}},
+            "required": ["amount"],
+        },
+    }]
+    fields = _fields("pay")
+    nonce = e2e.b64url_encode(b"\x02" * 16)
+    sent_at = int(time.time())
+    enc, ctx = e2e._SUITE.create_sender_context(
+        e2e._kem_public(service_key.public_raw), info=e2e.HPKE_INFO, sks=e2e._kem_private(client)
+    )
+    ct = ctx.seal(f'{{"amount": {constant}}}'.encode("utf-8"),
+                  aad=e2e.associated_data(fields, nonce, sent_at))
+    env = {
+        "alg": e2e.ALG, "mode": e2e.MODE, "kid": client.kid,
+        "enc": e2e.b64url_encode(enc), "ct": e2e.b64url_encode(ct),
+        "nonce": nonce, "sent_at": sent_at,
+    }
+    frame = _call(tool="pay", payload=env, request_id="r-e2e-nan",
+                  encryption="end-to-end", client_public_key=client.public_b64,
+                  client_kid=client.kid)
+
+    async def main():
+        from helpers import make_config
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        async def handler(ws):
+            await recv_json(ws)
+            await send_json(ws, {"type": "registered"})
+            await send_json(ws, frame)
+            done.set_result(await recv_json(ws))
+            await ws.wait_closed()
+
+        async with fake_gateway(handler) as url:
+            svc = GatewayService(
+                tools=bounded_tools, on_call=on_call,
+                config=make_config(url, key=service_key),
+                jwks_fetch=lambda _u: ISSUER.jwks(),
+            )
+            return await serve_until(svc, done)
+
+    reply = run(main())
+    assert reply["type"] == "error"
+    assert reply["code"] == "bad_arguments"
+    assert called == []
+
+
+@pytest.mark.parametrize("bad_raw", [
+    '{"type":"call","payload":{"x":NaN}}',
+    '{"type":"call","payload":{"x":Infinity}}',
+    '{"type":"call","payload":{"x":-Infinity}}',
+])
+def test_parse_rejects_nonfinite_json_constants(bad_raw):
+    from gateway_client.service import _parse
+    assert _parse(bad_raw) is None
+
+
+def test_websocket_redirect_refused_without_sending_credential():
+    from websockets.asyncio.server import serve
+
+    target_received = []
+
+    async def target_handler(ws):
+        target_received.append(await ws.recv())
+        await ws.close()
+
+    async def main():
+        async with serve(target_handler, "127.0.0.1", 0) as target_srv:
+            target_port = target_srv.sockets[0].getsockname()[1]
+            redirect_seen = asyncio.Event()
+
+            async def raw_http_redirect(reader, writer):
+                await reader.read(4096)
+                redirect_seen.set()
+                writer.write(
+                    f"HTTP/1.1 302 Found\r\nLocation: ws://127.0.0.1:{target_port}/backend\r\nContent-Length: 0\r\n\r\n".encode()
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            srv = await asyncio.start_server(raw_http_redirect, "127.0.0.1", 0)
+            redir_port = srv.sockets[0].getsockname()[1]
+            try:
+                svc = make_service(f"ws://127.0.0.1:{redir_port}/backend")
+                runner = asyncio.create_task(svc.run())
+                await asyncio.wait_for(redirect_seen.wait(), 5.0)
+                await asyncio.sleep(0.1)
+                await svc.stop()
+                await asyncio.wait_for(runner, 5.0)
+            finally:
+                srv.close()
+                await srv.wait_closed()
+
+    run(main())
+    assert target_received == []
+
+
+def test_outbound_wire_serializers_reject_nonfinite_floats():
+    from gateway_client.protocol import content_blocks, resource_contents
+
+    class FakeWS:
+        async def send(self, data):
+            pass
+
+    svc = make_service("ws://127.0.0.1:1/backend")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            content_blocks({"x": bad})
+        with pytest.raises(ValueError):
+            resource_contents({"x": bad}, "svc://s", "text/plain")
+        with pytest.raises(ValueError):
+            run(svc._send(FakeWS(), {"payload": bad}))
+
+

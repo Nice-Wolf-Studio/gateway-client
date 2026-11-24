@@ -59,7 +59,25 @@ from .logs import (
     current_request_id,
     request_scope,
 )
-from .protocol import Backoff, Declaration, ToolResult, content_blocks, parse_tool_result, resource_contents
+from .protocol import (
+    Backoff,
+    Declaration,
+    ToolResult,
+    content_blocks,
+    loads_strict,
+    parse_tool_result,
+    resource_contents,
+)
+
+_WS_CONNECT = connect
+
+
+class _NoRedirectConnect(connect):
+    """Refuse HTTP redirects on `/backend` so SERVICE_CREDENTIAL is never
+    transmitted to a redirect target."""
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
 
 log = logging.getLogger("gateway_client")
 # The WebSocket library logs every frame at DEBUG, and frames carry the
@@ -81,8 +99,9 @@ class Caller:
     nothing else. A call or read reaches the handler only after its token
     passed every check (signature, audience, expiry, required claims, no
     replay), so `principal` and `app` are always non-blank strings with no
-    leading or trailing whitespace and no Unicode `Cc` (control) or `Cf`
-    (format) characters, passed through unchanged without normalization.
+    leading or trailing whitespace and no Unicode `Cc` (control), `Cf`
+    (format), or `Zl`/`Zp` (line/paragraph separator) characters, passed
+    through unchanged without normalization.
 
     - `principal`: the principal WRN the call acts as (the token's `sub`):
       a user, or the agent the app acts for.
@@ -152,7 +171,7 @@ async def _invoke(fn: Callable[..., Any], *args: Any) -> Any:
 
 def _parse(raw: Any) -> dict[str, Any] | None:
     try:
-        frame = json.loads(raw)
+        frame = loads_strict(raw)
     except (TypeError, ValueError):
         return None
     return frame if isinstance(frame, dict) else None
@@ -461,10 +480,11 @@ class GatewayService:
     async def _attempt(self) -> _Attempt:
         """One connection: register, then serve until it ends."""
         log.info("connecting to %s (contract v2)", self.config.url)
+        connector = _NoRedirectConnect if connect is _WS_CONNECT else connect
         try:
-            async with connect(self.config.url, max_size=self._max_frame_bytes,
-                               open_timeout=self._reply_timeout,
-                               logger=_transport_log) as ws:
+            async with connector(self.config.url, max_size=self._max_frame_bytes,
+                                 open_timeout=self._reply_timeout,
+                                 logger=_transport_log) as ws:
                 self._conn = ws
                 if self._stop_event is not None and self._stop_event.is_set():
                     return _Attempt(_Outcome.FAILED, "stopping")
@@ -565,7 +585,7 @@ class GatewayService:
 
     async def _send(self, ws: ClientConnection, frame: dict[str, Any]) -> None:
         async with self._send_lock:
-            await ws.send(json.dumps(frame))
+            await ws.send(json.dumps(frame, allow_nan=False))
 
     async def _announce(self, ftype: str) -> bool:
         ws = self._ws

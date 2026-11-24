@@ -415,3 +415,216 @@ def test_async_fetch_supported():
 ])
 def test_jwks_url_derived_from_backend_url(backend, jwks):
     assert ct.jwks_url_for(backend) == jwks
+
+
+# --- #43: non-finite exp (NaN / Infinity / -Infinity) -------------------------------
+
+def _raw_ed25519_jwt(issuer: Issuer, payload_bytes: bytes, *, kid: str | None = None) -> str:
+    import json
+    from gateway_client.e2e import b64url_encode
+    hdr = b64url_encode(json.dumps({"alg": "EdDSA", "kid": issuer.kid if kid is None else kid}).encode())
+    body = b64url_encode(payload_bytes)
+    sig = b64url_encode(issuer._key.sign(f"{hdr}.{body}".encode()))
+    return f"{hdr}.{body}.{sig}"
+
+
+@pytest.mark.parametrize("bad_exp", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_exp_refused_and_never_leaks_replay_cache(bad_exp):
+    issuer = Issuer()
+    verifier = _verifier(Fetcher(issuer))
+    payload = (
+        f'{{"sub":"{PRINCIPAL}","act":"{APP}","aud":"svc",'
+        f'"iat":{int(NOW)},"exp":{bad_exp},"jti":"j-nan-{bad_exp}"}}'
+    ).encode("utf-8")
+    tok = _raw_ed25519_jwt(issuer, payload)
+    err = _refused(verifier, tok)
+    assert err.code == "not_allowed"
+    assert verifier.replay_cache_size == 0
+    verifier._forget_expired(9_999_999_999.0)
+    assert verifier.replay_cache_size == 0
+
+
+# --- #46: U+2028 / U+2029 in identity claims & kid ----------------------------------
+
+@pytest.mark.parametrize("field", ["sub", "act", "jti", "kid"])
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029"])
+def test_unicode_line_separators_refused_in_identity_and_kid(field, sep):
+    issuer = Issuer()
+    bad = f"wrn:app1{sep}wrn:app2"
+    if field == "kid":
+        issuer.kid = bad
+    fetch = Fetcher(issuer)
+    err = _refused(_verifier(fetch), issuer.token(now=NOW, **{field: bad}))
+    assert err.code == "not_allowed"
+    if field == "kid":
+        assert fetch.count == 0
+
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029"])
+def test_unicode_line_separators_refused_in_agent_claim(sep):
+    issuer = Issuer()
+    err = _refused(_verifier(Fetcher(issuer)), issuer.token(now=NOW, agent=f"wrn:access:agent/a{sep}b"))
+    assert err.code == "not_allowed"
+
+
+# --- #48 & #47: fetch_jwks refuses redirects, non-http(s), and NaN/Infinity ---------
+
+def test_fetch_jwks_refuses_http_redirects_and_marks_keyset_unavailable(monkeypatch):
+    import http.server
+    import threading
+    import urllib.error
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect-cross":
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/evil.json")
+                self.end_headers()
+            elif self.path == "/redirect-file":
+                self.send_response(302)
+                self.send_header("Location", "file:///etc/passwd")
+                self.end_headers()
+            elif self.path == "/redirect-downgrade":
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/jwks.json")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"keys":[]}')
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for path in ("/redirect-cross", "/redirect-file", "/redirect-downgrade"):
+            with pytest.raises(Exception):
+                ct.fetch_jwks(f"http://127.0.0.1:{port}{path}")
+            ks = KeySet(f"http://127.0.0.1:{port}{path}")
+            with pytest.raises(TokenRefused) as exc:
+                run(ks.key("k1"))
+            assert exc.value.code == "unavailable"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # Also test https:// -> http:// redirect directly against the redirect handler
+    import urllib.request
+    req = urllib.request.Request("https://gw.example/.well-known/jwks.json")
+    with pytest.raises((urllib.error.URLError, ValueError)):
+        ct._NoRedirectHandler().redirect_request(req, None, 302, "Found", {}, "http://gw.example/jwks.json")
+
+
+def test_fetch_jwks_refuses_non_http_scheme_and_nonfinite_json():
+    import http.server
+    import threading
+
+    with pytest.raises(ValueError):
+        ct.fetch_jwks("file:///etc/passwd")
+
+    class NaNHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"keys": [], "x": NaN}')
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), NaNHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ValueError):
+            ct.fetch_jwks(f"http://127.0.0.1:{port}/jwks.json")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# --- #49: KeySet cooldown unavailable & CancelledError mid-fetch --------------------
+
+def test_keyset_retry_during_cooldown_after_failed_refetch_is_unavailable():
+    old, new = Issuer(), Issuer()
+    clock = Clock(0.0)
+    fetch = Fetcher(old)
+    ks = KeySet("https://gw.test/.well-known/jwks.json", fetch=fetch, clock=clock,
+                min_refetch_interval=10.0)
+    assert run(ks.key(old.kid)).key_id == old.kid
+
+    # Gateway rotates to new key while JWKS endpoint fails
+    fetch.fail = True
+    clock.t = 10.0
+    with pytest.raises(TokenRefused) as err1:
+        run(ks.key(new.kid))
+    assert err1.value.code == "unavailable"
+
+    # Retry within 10 s cooldown must STILL be unavailable, not not_allowed
+    clock.t = 11.0
+    with pytest.raises(TokenRefused) as err2:
+        run(ks.key(new.kid))
+    assert err2.value.code == "unavailable"
+    assert fetch.count == 2
+
+
+def test_keyset_stale_refresh_failure_keeps_cached_kid_and_marks_unknown_unavailable():
+    old, new = Issuer(), Issuer()
+    clock = Clock(0.0)
+    fetch = Fetcher(old)
+    ks = KeySet("https://gw.test/.well-known/jwks.json", fetch=fetch, clock=clock,
+                min_refetch_interval=10.0, max_age=3600.0)
+    assert run(ks.key(old.kid)).key_id == old.kid
+
+    # Key set becomes stale at t=3600, refresh fails
+    fetch.fail = True
+    clock.t = 3600.0
+    with pytest.raises(TokenRefused) as err1:
+        run(ks.key(new.kid))
+    assert err1.value.code == "unavailable"
+
+    # At t=3601 (inside cooldown): known cached kid succeeds; unknown kid is unavailable
+    clock.t = 3601.0
+    assert run(ks.key(old.kid)).key_id == old.kid
+    with pytest.raises(TokenRefused) as err2:
+        run(ks.key(new.kid))
+    assert err2.value.code == "unavailable"
+
+
+def test_keyset_cancelled_fetch_allows_waiter_to_fetch_cleanly():
+    import asyncio
+
+    issuer = Issuer()
+    calls = 0
+
+    async def main():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fetch(url):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release.wait()
+            return issuer.jwks()
+
+        ks = KeySet("https://gw.test/.well-known/jwks.json", fetch=fetch,
+                    min_refetch_interval=10.0)
+        task_a = asyncio.create_task(ks.key(issuer.kid))
+        await entered.wait()
+        task_b = asyncio.create_task(ks.key(issuer.kid))
+        await asyncio.sleep(0)  # let task_b block on _get_lock()
+        task_a.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task_a
+        k = await asyncio.wait_for(task_b, 2.0)
+        assert k.key_id == issuer.kid
+        assert calls == 2
+
+    run(main())
