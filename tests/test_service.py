@@ -2086,3 +2086,200 @@ def test_outbound_wire_serializers_reject_nonfinite_floats():
             run(svc._send(FakeWS(), {"payload": bad}))
 
 
+# --- #44, #45, #50 service tests --------------------------------------------------------
+
+def test_failed_open_envelope_does_not_pin_app_and_allows_later_none_call(tmp_path):
+    client, impostor, service_key = KeyPair.generate(), KeyPair.generate(), KeyPair.generate()
+    pin_file = tmp_path / "pins.txt"
+    app = APP
+
+    bad_shapes = [
+        "not-an-envelope",
+        {},
+    ]
+    # Wrong envelope kid
+    wrong_kid_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                             fields=_fields())
+    wrong_kid_env["kid"] = impostor.kid
+    # Tampered ciphertext
+    tampered_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                            fields=_fields())
+    tampered_env["ct"] = e2e.b64url_encode(b"\xff" * 24)
+    # Wrong sender key
+    wrong_sender_env = e2e.seal({"text": "x"}, sender=impostor, recipient_public_raw=service_key.public_raw,
+                                fields=_fields())
+    wrong_sender_env["kid"] = client.kid
+    # Stale sent_at
+    stale_env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                         fields=_fields(), now=time.time() - 301)
+
+    bad_frames = []
+    for idx, env in enumerate([*bad_shapes, wrong_kid_env, tampered_env, wrong_sender_env, stale_env]):
+        bad_frames.append(_call(
+            tool="echo", payload=env, request_id=f"r-bad-{idx}",
+            encryption="end-to-end", client_public_key=client.public_b64,
+            client_kid=client.kid, token=ISSUER.token(act=app),
+        ))
+    # Follow-up plaintext call must STILL succeed
+    plain = _call(tool="echo", payload={"text": "still-allowed"}, request_id="r-plain-ok",
+                  encryption="none", token=ISSUER.token(act=app))
+
+    _, replies = run(_one_exchange([*bad_frames, plain], service_kwargs={
+        "key": service_key, "pin_store_file": pin_file}))
+    assert all(r["type"] == "error" for r in replies[:-1])
+    assert replies[-1]["type"] == "result"
+    assert replies[-1]["payload"] == [{"type": "text", "text": "echo:still-allowed"}]
+    assert app not in FilePinStore(pin_file)
+
+
+def test_replayed_nonce_first_call_pins_but_first_time_stale_or_failed_does_not():
+    # Also verify AC3 of #44: valid open_envelope pins even if _check_schema or on_call raises ServiceError
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def failing_call(tool, arguments, caller):
+        raise ServiceError("unavailable", "downstream down")
+
+    # 1. Valid envelope, fails _check_schema (missing required "text") -> pins app
+    bad_schema_frame, _ = _e2e_call(client, service_key.public_raw, {"wrong": 1}, request_id="r-schema")
+    plain_after_schema = _call(payload={"text": "x"}, request_id="r-plain-1")
+    _, replies1 = run(_one_exchange([bad_schema_frame, plain_after_schema],
+                                    service_kwargs={"key": service_key}))
+    assert replies1[0]["code"] == "bad_arguments"
+    assert replies1[1]["code"] == "not_allowed"
+
+    # 2. Valid envelope, handler raises ServiceError -> pins app
+    ok_frame, _ = _e2e_call(client, service_key.public_raw, {"text": "x"}, request_id="r-svc-err")
+    plain_after_err = _call(payload={"text": "x"}, request_id="r-plain-2")
+    _, replies2 = run(_one_exchange([ok_frame, plain_after_err],
+                                    service_kwargs={"key": service_key, "on_call": failing_call}))
+    assert replies2[0]["code"] == "unavailable"
+    assert replies2[1]["code"] == "not_allowed"
+
+    # 3. Replayed nonce from app1 is tested after app1 already succeeded once;
+    #    test fresh app2 with replayed nonce via shared ReplayGuard? Impossible without prior claim,
+    #    so verify directly on ReplayGuard pre-claimed nonce:
+    svc = make_service("ws://localhost:9999", issuer=ISSUER, key=service_key)
+    env = e2e.seal({"text": "x"}, sender=client, recipient_public_raw=service_key.public_raw,
+                   fields=_fields())
+    svc._replay.claim(APP, env["nonce"], time.time())
+    replay_frame = _call(tool="echo", payload=env, request_id="r-rep", encryption="end-to-end",
+                         client_public_key=client.public_b64, client_kid=client.kid)
+    rep = run(svc._reply(replay_frame))
+    assert rep["code"] == "not_allowed"
+    assert APP not in svc.pinned
+
+
+def test_ac23_undeclared_tool_and_declared_not_found_match_in_e2e_mode():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def on_call(tool, arguments, caller):
+        raise ServiceError("not_found", "unknown tool: nonexistent_tool")
+
+    declared_frame, declared_fields = _e2e_call(
+        client, service_key.public_raw, {"text": "x"}, tool="echo", request_id="r-decl"
+    )
+    undeclared_frame, undeclared_fields = _e2e_call(
+        client, service_key.public_raw, {"text": "x"}, tool="nonexistent_tool",
+        request_id="r-undecl"
+    )
+
+    _, replies = run(_one_exchange([declared_frame, undeclared_frame],
+                                   service_kwargs={"key": service_key, "on_call": on_call}))
+    r_decl, r_undecl = replies
+    assert set(r_decl) == set(r_undecl)
+    assert r_decl["code"] == r_undecl["code"] == "not_found"
+    assert isinstance(r_decl["payload"], dict)
+    assert isinstance(r_undecl["payload"], dict)
+    assert _open_reply(r_decl, client, service_key, declared_fields) == "unknown tool: nonexistent_tool"
+    assert _open_reply(r_undecl, client, service_key, undeclared_fields) == "unknown tool: nonexistent_tool"
+
+
+def test_e2e_undeclared_resource_and_none_on_read_are_sealed_not_found():
+    client, service_key = KeyPair.generate(), KeyPair.generate()
+
+    async def on_read(uri, caller):
+        return "ok"
+
+    def read_frame(uri, req_id):
+        return _read(
+            uri=uri, request_id=req_id, encryption="end-to-end",
+            client_public_key=client.public_b64, client_kid=client.kid,
+        )
+
+    # Case 1: undeclared URI when on_read is provided
+    f1 = read_frame("svc://missing", "r-read-undecl")
+    _, replies1 = run(_one_exchange([f1], service_kwargs={"key": service_key, "on_read": on_read}))
+    assert replies1[0]["code"] == "not_found"
+    assert isinstance(replies1[0]["payload"], dict)
+    fields1 = e2e.header(user_id=PRINCIPAL, client_id=APP, service="svc", uri="svc://missing")
+    assert _open_reply(replies1[0], client, service_key, fields1) == "unknown resource: svc://missing"
+
+    # Case 2: declared URI when on_read is None
+    f2 = read_frame("svc://status", "r-read-nohandler")
+    _, replies2 = run(_one_exchange([f2], service_kwargs={"key": service_key, "on_read": None}))
+    assert replies2[0]["code"] == "not_found"
+    assert isinstance(replies2[0]["payload"], dict)
+    fields2 = e2e.header(user_id=PRINCIPAL, client_id=APP, service="svc", uri="svc://status")
+    assert _open_reply(replies2[0], client, service_key, fields2) == "unknown resource: svc://status"
+
+    # Case 3: undeclared E2E target must not pin caller.app
+    plain_followup = _call(tool="echo", payload={"text": "still-allowed"}, request_id="r-plain-after-undecl")
+    _, replies3 = run(_one_exchange(
+        [read_frame("svc://missing", "r-read-undecl-2"), plain_followup],
+        service_kwargs={"key": service_key, "on_read": on_read},
+    ))
+    assert replies3[0]["code"] == "not_found"
+    assert replies3[1]["type"] == "result"
+
+
+def test_none_mode_non_serializable_list_sends_internal_and_logs_internal(caplog):
+    async def on_call(tool, arguments, caller):
+        if arguments.get("text") == "nan":
+            return [{"type": "text", "text": float("nan")}]
+        return [{"type": "text", "text": object()}]
+
+    async def on_read(uri, caller):
+        return [{"uri": uri, "text": object()}]
+
+    frames = [
+        _call(payload={"text": "obj"}, request_id="r-nonser-obj"),
+        _call(payload={"text": "nan"}, request_id="r-nonser-nan"),
+        _read(request_id="r-nonser-read"),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="gateway_client"):
+        _, replies = run(_one_exchange(frames, service_kwargs={"on_call": on_call, "on_read": on_read}))
+
+    assert replies == [
+        {"type": "error", "request_id": "r-nonser-obj", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+        {"type": "error", "request_id": "r-nonser-nan", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+        {"type": "error", "request_id": "r-nonser-read", "encryption": "none",
+         "code": "internal", "payload": "internal error"},
+    ]
+    ends = [r for r in caplog.records if getattr(r, "gw_fields", {}).get("event") == "call.end"]
+    assert len(ends) == 3
+    for end in ends:
+        assert end.gw_fields["outcome"] == "internal"
+        assert end.levelno == logging.ERROR
+
+
+def test_none_mode_plain_json_array_wrapped_in_service_call_and_read():
+    async def on_call(tool, arguments, caller):
+        return [1, 2, 3]
+
+    async def on_read(uri, caller):
+        return [{"id": 1}]
+
+    _, replies = run(_one_exchange(
+        [_call(payload={"text": "x"}, request_id="r-arr-call"),
+         _read(request_id="r-arr-read")],
+        service_kwargs={"on_call": on_call, "on_read": on_read},
+    ))
+    assert replies[0]["type"] == "result"
+    assert replies[0]["payload"] == [{"type": "text", "text": "[1, 2, 3]"}]
+    assert replies[1]["type"] == "result"
+    assert replies[1]["payload"] == [{"uri": "svc://status", "mimeType": "application/json",
+                                      "text": '[{"id": 1}]'}]
+
+

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
-from gateway_client.protocol import ToolResult, content_blocks, parse_tool_result
+from gateway_client.protocol import (
+    ToolResult,
+    content_blocks,
+    parse_tool_result,
+    resource_contents,
+)
 
 
 def test_tool_result_defaults_and_properties():
@@ -85,9 +90,9 @@ def test_parse_tool_result_with_dict():
     assert blocks == [{"type": "text", "text": "not found"}]
     assert is_error is True
 
-    # dict with isError: True without content
+    # dict with isError: True without content is a plain domain dict (#51)
     blocks, is_error = parse_tool_result({"isError": True, "code": 123})
-    assert is_error is True
+    assert is_error is False
     assert json.loads(blocks[0]["text"]) == {"isError": True, "code": 123}
 
     # dict with isError: False and content
@@ -109,3 +114,64 @@ def test_parse_tool_result_plain():
     blocks, is_error = parse_tool_result([{"type": "text", "text": "list item"}])
     assert blocks == [{"type": "text", "text": "list item"}]
     assert is_error is False
+
+
+# --- #50 & #51: plain JSON lists and domain dicts with is_error / isError ----------
+
+def test_content_blocks_wraps_plain_json_lists_and_preserves_mcp_blocks():
+    assert content_blocks([]) == []
+    assert content_blocks([{"type": "text", "text": "hi"}]) == [{"type": "text", "text": "hi"}]
+    assert content_blocks([{"type": "image", "data": "abc", "mimeType": "image/png"}]) == [
+        {"type": "image", "data": "abc", "mimeType": "image/png"}
+    ]
+    assert content_blocks([1, 2, 3]) == [{"type": "text", "text": "[1, 2, 3]"}]
+    assert content_blocks([{"id": 1}]) == [{"type": "text", "text": '[{"id": 1}]'}]
+    assert content_blocks([{"type": ""}]) == [{"type": "text", "text": '[{"type": ""}]'}]
+
+
+def test_resource_contents_wraps_plain_json_lists_and_preserves_mcp_contents():
+    assert resource_contents([], "res://x", "text/plain") == []
+    mcp = [{"uri": "res://x", "mimeType": "text/plain", "text": "hi"}]
+    assert resource_contents(mcp, "res://x", "text/plain") == mcp
+    assert resource_contents([1, 2, 3], "res://x", "text/plain") == [
+        {"uri": "res://x", "mimeType": "application/json", "text": "[1, 2, 3]"}
+    ]
+    assert resource_contents([{"id": 1}], "res://x", "text/plain") == [
+        {"uri": "res://x", "mimeType": "application/json", "text": '[{"id": 1}]'}
+    ]
+
+
+def test_parse_tool_result_preserves_domain_dicts_with_is_error_fields():
+    msg_dict = {"id": 42, "author": "alice", "content": "hello", "is_error": False}
+    blocks, is_error = parse_tool_result(msg_dict)
+    assert is_error is False
+    assert json.loads(blocks[0]["text"]) == msg_dict
+
+    job_dict = {"job_id": "99", "is_error": True}
+    blocks2, is_error2 = parse_tool_result(job_dict)
+    assert is_error2 is False
+    assert json.loads(blocks2[0]["text"]) == job_dict
+
+    # Real ToolResult envelopes remain supported
+    assert parse_tool_result({"content": "boom", "is_error": True}) == (
+        [{"type": "text", "text": "boom"}], True
+    )
+    assert parse_tool_result({"content": [{"type": "text", "text": "boom"}], "isError": True}) == (
+        [{"type": "text", "text": "boom"}], True
+    )
+    # Non-boolean isError is not treated as a ToolResult envelope
+    nonbool = {"content": "boom", "isError": "yes"}
+    blocks3, is_error3 = parse_tool_result(nonbool)
+    assert is_error3 is False
+    assert json.loads(blocks3[0]["text"]) == nonbool
+
+    # Domain dict wrapped in ToolResult is never stripped
+    wrapped = ToolResult(msg_dict, is_error=False)
+    blocks4, is_error4 = parse_tool_result(wrapped)
+    assert is_error4 is False
+    assert json.loads(blocks4[0]["text"]) == msg_dict
+    assert json.loads(content_blocks(wrapped)[0]["text"]) == msg_dict
+    wrapped_exact = ToolResult({"content": "hello", "is_error": False}, is_error=True)
+    blocks5, is_error5 = parse_tool_result(wrapped_exact)
+    assert is_error5 is True
+    assert json.loads(blocks5[0]["text"]) == {"content": "hello", "is_error": False}
