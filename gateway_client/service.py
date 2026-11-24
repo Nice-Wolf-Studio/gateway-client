@@ -775,19 +775,21 @@ class GatewayService:
                 raise ServiceError(BAD_ARGUMENTS, "unknown encryption mode")
             if encryption == e2e.ENCRYPTION_E2E:
                 client_key = self._client_key(frame)
+                if isinstance(target, str) and target:
+                    fields = e2e.header(
+                        user_id=caller.principal, client_id=caller.app,
+                        service=verified.claims["aud"], encryption=encryption,
+                        **({"tool": target} if is_call else {"uri": target}))
             declared = self._check_target(is_call, target)
             if encryption == e2e.ENCRYPTION_E2E:
-                fields = e2e.header(
-                    user_id=caller.principal, client_id=caller.app,
-                    service=verified.claims["aud"], encryption=encryption,
-                    **({"tool": target} if is_call else {"uri": target}))
-                self._pinned.add(caller.app)
                 arguments = None
                 if is_call:
                     arguments = e2e.open_envelope(
                         frame.get("payload"), recipient=self.config.key,
                         sender_public_raw=client_key, fields=fields, replay=self._replay,
                         replay_client_id=caller.app)
+                self._pinned.add(caller.app)
+                if is_call:
                     self._check_schema(declared, arguments)
             else:
                 self._check_plaintext_allowed(caller.app)
@@ -847,4 +849,12 @@ class GatewayService:
         if is_error and ftype == "result":
             reply["is_error"] = True
         reply["payload"] = payload
+        try:
+            json.dumps(reply, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            log.warning("request_id=%s: could not serialize the reply (%s); answering "
+                        "plain error %s", _safe_str(request_id), type(exc).__name__, INTERNAL)
+            reply = {"type": "error", "request_id": request_id,
+                     "encryption": encryption, "code": INTERNAL,
+                     "payload": "internal error"}
         return reply

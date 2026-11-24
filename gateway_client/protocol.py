@@ -232,20 +232,44 @@ class ToolResult:
         return False
 
 
-def content_blocks(value: Any) -> list[Any]:
-    """A handler's tool result as MCP content blocks: a list is kept, a
-    string becomes one text block, anything else one text block of its JSON.
-    If given a ToolResult or a dict with isError/is_error and content,
-    extracts the inner content."""
-    if isinstance(value, ToolResult):
-        return content_blocks(value.content)
-    if isinstance(value, dict) and ("isError" in value or "is_error" in value) and "content" in value:
-        return content_blocks(value["content"])
-    if isinstance(value, list):
+def _is_mcp_content_list(value: list[Any]) -> bool:
+    return all(isinstance(item, dict) and isinstance(item.get("type"), str) and bool(item["type"])
+               for item in value)
+
+
+def _is_mcp_resource_list(value: list[Any]) -> bool:
+    return all(isinstance(item, dict) and isinstance(item.get("uri"), str)
+               and ("text" in item or "blob" in item) for item in value)
+
+
+def _is_tool_result_dict(value: Any) -> bool:
+    if not isinstance(value, dict) or "content" not in value:
+        return False
+    keys = set(value)
+    if not (keys <= {"content", "isError", "is_error"}):
+        return False
+    err_keys = keys & {"isError", "is_error"}
+    return bool(err_keys) and all(isinstance(value[k], bool) for k in err_keys)
+
+
+def _format_content(value: Any) -> list[Any]:
+    if isinstance(value, list) and _is_mcp_content_list(value):
         return value
     if isinstance(value, str):
         return [{"type": "text", "text": value}]
     return [{"type": "text", "text": json.dumps(value, default=str, allow_nan=False)}]
+
+
+def content_blocks(value: Any) -> list[Any]:
+    """A handler's tool result as MCP content blocks: a list of MCP content
+    block dicts is kept, a string becomes one text block, anything else one
+    text block of its JSON. If given a ToolResult or a dict with only
+    `content` and boolean `isError`/`is_error`, extracts the inner content."""
+    if isinstance(value, ToolResult):
+        return _format_content(value.content)
+    if _is_tool_result_dict(value):
+        return _format_content(value["content"])
+    return _format_content(value)
 
 
 def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
@@ -253,24 +277,24 @@ def parse_tool_result(value: Any) -> tuple[list[Any], bool]:
 
     Accepts:
     - ToolResult instance
-    - dict with "isError" or "is_error"
-    - list of content blocks
+    - dict with "content" and boolean "isError" or "is_error" (no extra keys)
+    - list of MCP content blocks
     - string
     - any JSON-serializable value
     """
     if isinstance(value, ToolResult):
-        return content_blocks(value.content), value.is_error
-    if isinstance(value, dict) and ("isError" in value or "is_error" in value):
-        is_error = bool(value.get("isError") if "isError" in value else value.get("is_error"))
-        raw = value["content"] if "content" in value else value
-        return content_blocks(raw), is_error
-    return content_blocks(value), False
+        return _format_content(value.content), value.is_error
+    if _is_tool_result_dict(value):
+        is_error = value["isError"] if "isError" in value else value["is_error"]
+        return _format_content(value["content"]), is_error
+    return _format_content(value), False
 
 
 def resource_contents(value: Any, uri: str, mime_type: str) -> list[Any]:
-    """A handler's resource read as MCP contents: a list is kept, a string
-    becomes one text content, anything else one text content of its JSON."""
-    if isinstance(value, list):
+    """A handler's resource read as MCP contents: a list of MCP resource
+    content dicts is kept, a string becomes one text content, anything else
+    one text content of its JSON."""
+    if isinstance(value, list) and _is_mcp_resource_list(value):
         return value
     if isinstance(value, str):
         return [{"uri": uri, "mimeType": mime_type, "text": value}]

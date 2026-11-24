@@ -36,10 +36,11 @@ This file provides load-bearing working notes and operational guidelines for AI 
 When a frame arrives, `GatewayService._reply` enforces this strict precedence:
 1. **`caller_token` verification (`_verify_caller`)** → failure yields `not_allowed` (`caller token refused`). Identity claims (`sub`, `act`, `jti`) and header `kid` are validated via `_check_id_str`: must be non-blank `str`, no leading/trailing whitespace, and zero Unicode `Cc` (control), `Cf` (format), or `Zl`/`Zp` (line/paragraph separator) characters. `exp` must be finite (`NaN`/`Infinity`/`-Infinity` are refused). Claims are never normalized. The optional `agent` claim (not required) is checked the same way and must be a `wrn:access:agent/<id>` WRN; it is exposed as `VerifiedToken.agent` / `Caller.agent` (None when absent).
 2. **`encryption` mode check** (`none` or `end-to-end`) → invalid yields `bad_arguments`.
-3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning.
-4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found`.
+3. **Client key & AAD header check (`_client_key`)** in `end-to-end` mode → validates key shape and tests X25519 Diffie-Hellman exchange (`check_public_key`). Unsealable or small-order keys are rejected with `bad_arguments` before binding or pinning. For non-empty string targets, the AAD `fields` header is constructed immediately so subsequent `not_found` errors are sealed (AC 23).
+4. **Target validation (`_check_target`)** → missing or undeclared tool/resource yields `not_found` (sealed in `end-to-end` mode when `target` is a non-empty string).
 5. **Payload handling & downgrade pinning**:
-   - Connected apps (`caller.app` / `act` WRN) seen in `end-to-end` mode are recorded in `self._pinned`.
+   - In `end-to-end` `call` mode, `e2e.open_envelope` authenticates the envelope before `caller.app` is added to `self._pinned` (preventing unauthenticated lockout on malformed/unauthenticated envelopes).
+   - Connected apps (`caller.app` / `act` WRN) seen in authenticated `end-to-end` calls (or valid E2E `read_resource` frames) are recorded in `self._pinned`.
    - Subsequent `none` calls from a pinned app are refused with `not_allowed`.
 
 ### 3.2. Statelessness & Pin Persistence (Q2 / D2)
@@ -54,7 +55,7 @@ When a frame arrives, `GatewayService._reply` enforces this strict precedence:
 - **Context helper**: `current_request_id()` returns the active request ID inside handlers across async boundaries, and `None` outside.
 
 ### 3.4. Application Tool Errors (`isError=True`)
-- Handlers can return `ToolResult(content=..., isError=True)` or a mapping with `{"isError": True, "content": [...]}`.
+- Handlers can return `ToolResult(content=..., isError=True)` or a dict whose keys are a subset of `{"content", "isError", "is_error"}` with `"content"` present and a boolean error flag. Plain domain dicts with `"is_error"`/`"isError"` and extra keys (or missing `"content"`) are serialized intact as normal tool results. Plain JSON lists (whose elements are not MCP content blocks) are wrapped into a single text block / JSON resource content entry.
 - In `none` mode, the frame carries `"is_error": True`.
 - In `end-to-end` mode, `"is_error": True` is authenticated within the HPKE envelope associated data (`associated_data` / `reply_header`), ensuring tampering fails AEAD decryption.
 - The outcome is traced as `outcome="tool_error"`.
