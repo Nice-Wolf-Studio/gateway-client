@@ -284,17 +284,30 @@ class ReplayGuard:
     def __init__(self, window: float = REPLAY_WINDOW_SECONDS) -> None:
         self._window = window
         self._seen: dict[str, dict[str, float]] = {}
+        self._purged_at = float("-inf")
         self._lock = threading.Lock()
 
     def claim(self, client_id: str, nonce: str, now: float) -> bool:
         """Record `nonce` for `client_id`; False when it was already recorded
         within the window (a replay). Check and record are one atomic step."""
         with self._lock:
-            nonces = self._seen.setdefault(client_id, {})
-            for old in [n for n, exp in nonces.items() if exp <= now]:
-                del nonces[old]
-            if nonce in nonces:
-                return False
+            if now - self._purged_at >= 1.0:
+                self._purged_at = now
+                empty_clients: list[str] = []
+                for cid, bucket in self._seen.items():
+                    for old in [n for n, exp in bucket.items() if exp <= now]:
+                        del bucket[old]
+                    if not bucket:
+                        empty_clients.append(cid)
+                for cid in empty_clients:
+                    del self._seen[cid]
+            nonces = self._seen.get(client_id)
+            if nonces is not None:
+                exp = nonces.get(nonce)
+                if exp is not None and exp > now:
+                    return False
+            else:
+                nonces = self._seen[client_id] = {}
             nonces[nonce] = now + self._window
             return True
 
@@ -329,5 +342,7 @@ def open_envelope(envelope: Any, *, recipient: KeyPair, sender_public_raw: bytes
         raise E2EError(NOT_ALLOWED, "envelope nonce was already used")
     try:
         return loads_strict(plaintext.decode("utf-8"))
+    except RecursionError:
+        raise E2EError(BAD_ARGUMENTS, "envelope plaintext is too deeply nested") from None
     except (UnicodeDecodeError, ValueError):
         raise E2EError(BAD_ARGUMENTS, "envelope plaintext is not UTF-8 JSON") from None

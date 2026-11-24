@@ -103,7 +103,12 @@ class RequestIdFilter(logging.Filter):
 # --- formatting --------------------------------------------------------------
 
 def _kv_value(value: Any) -> str:
-    return _safe_str(value if isinstance(value, str) else to_json(value))
+    if isinstance(value, str):
+        safe = _safe_str(value)
+        if not safe or any(ch.isspace() or ch in '="' for ch in safe):
+            return to_json(value)
+        return safe
+    return _safe_str(to_json(value))
 
 
 def text_line(message: str, fields: Mapping[str, Any]) -> str:
@@ -143,11 +148,12 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         fields = getattr(record, "gw_fields", None)
+        gw_message = getattr(record, "gw_message", None)
         out: dict[str, Any] = {
             "timestamp": _iso_utc(record.created),
             "level": record.levelname,
             "logger": record.name,
-            "message": getattr(record, "gw_message", None) or record.getMessage(),
+            "message": gw_message if gw_message is not None else record.getMessage(),
         }
         if fields:
             out.update(fields)

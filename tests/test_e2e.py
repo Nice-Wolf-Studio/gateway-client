@@ -196,3 +196,46 @@ def test_canonical_json_and_seal_reject_nonfinite_floats(bad_val):
     with pytest.raises(ValueError):
         e2e.seal({"x": bad_val}, sender=client, recipient_public_raw=service.public_raw,
                  fields=_fields(), now=NOW)
+
+
+def test_open_envelope_deeply_nested_json_raises_e2e_bad_arguments():
+    client, service = _pair()
+    nonce = e2e.b64url_encode(b"\x01" * 16)
+    sent_at = int(NOW)
+    fields = _fields()
+    enc, ctx = e2e._SUITE.create_sender_context(
+        e2e._kem_public(service.public_raw), info=e2e.HPKE_INFO, sks=e2e._kem_private(client)
+    )
+    deep = b'{"a":' * 10000 + b"1" + b"}" * 10000
+    ct = ctx.seal(deep, aad=e2e.associated_data(fields, nonce, sent_at))
+    env = {
+        "alg": e2e.ALG, "mode": e2e.MODE, "kid": client.kid,
+        "enc": e2e.b64url_encode(enc), "ct": e2e.b64url_encode(ct),
+        "nonce": nonce, "sent_at": sent_at,
+    }
+    with pytest.raises(E2EError) as exc:
+        e2e.open_envelope(env, recipient=service, sender_public_raw=client.public_raw,
+                          fields=fields, now=sent_at)
+    assert exc.value.code == "bad_arguments"
+
+
+def test_replay_guard_evicts_expired_client_buckets_and_handles_concurrent_reuse():
+    from concurrent.futures import ThreadPoolExecutor
+
+    guard = ReplayGuard(window=600)
+    for i in range(1000):
+        assert guard.claim(f"c-{i}", "n1", now=0.0) is True
+    assert guard.claim("other_client", "n", now=601.0) is True
+    assert len(guard._seen) == 1
+
+    # Expired nonce is still accepted even within <1s before next global sweep
+    subsec_guard = ReplayGuard(window=0.2)
+    assert subsec_guard.claim("c1", "n1", now=100.0) is True
+    assert subsec_guard.claim("c1", "n1", now=100.3) is True
+
+    # Concurrent reuse of non-expired nonce yields exactly one True
+    conc_guard = ReplayGuard(window=600)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: conc_guard.claim("c1", "same", now=10.0), range(16)))
+    assert results.count(True) == 1
+    assert results.count(False) == 15

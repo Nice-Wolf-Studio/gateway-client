@@ -13,11 +13,14 @@ without them is unchanged). Version 2 has no `roles` or
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+import jsonschema
 
 CONTRACT_VERSION = 2
 
@@ -31,7 +34,14 @@ SUPERSEDED_CLOSE_CODE = 4001
 
 
 def _nonempty_str(value: Any) -> bool:
-    return isinstance(value, str) and bool(value)
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
+def _check_json_serializable(label: str, value: Any) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be RFC 8259 JSON-serializable: {exc}") from None
 
 
 def _reject_nonfinite(token: str) -> Any:
@@ -145,13 +155,21 @@ class Declaration:
               service: str | None = None) -> "Declaration":
         """`service` is the service's name; it is needed (to check the
         `<service>_` prefix) only when there are prompts."""
-        tools, resources, prompts = list(tools), list(resources), list(prompts)
+        tools = [copy.deepcopy(t) for t in tools]
+        resources = [copy.deepcopy(r) for r in resources]
+        prompts = [copy.deepcopy(p) for p in prompts]
         tool_names: set[str] = set()
         for i, tool in enumerate(tools):
             if not (isinstance(tool, dict) and _nonempty_str(tool.get("name"))
                     and isinstance(tool.get("description"), str)
                     and isinstance(tool.get("inputSchema"), dict)):
                 raise ValueError(f"tools[{i}] needs name, description and inputSchema")
+            _check_json_serializable(f"tools[{i}]", tool)
+            try:
+                validator = jsonschema.validators.validator_for(tool["inputSchema"])
+                validator.check_schema(tool["inputSchema"])
+            except (jsonschema.SchemaError, TypeError, ValueError) as exc:
+                raise ValueError(f"tools[{i}] inputSchema is invalid: {exc}") from None
             if "annotations" in tool:
                 _check_annotations(i, tool["annotations"])
             if tool["name"] in tool_names:
@@ -164,6 +182,7 @@ class Declaration:
                     and isinstance(res.get("mimeType"), str)
                     and isinstance(res.get("description"), str)):
                 raise ValueError(f"resources[{i}] needs uri, name, mimeType and description")
+            _check_json_serializable(f"resources[{i}]", res)
             if res["uri"] in uris:
                 raise ValueError(f"resource {res['uri']!r} declared twice")
             uris.add(res["uri"])
@@ -172,6 +191,7 @@ class Declaration:
         prompt_names: set[str] = set()
         for i, prompt in enumerate(prompts):
             _check_prompt(i, prompt, prompt_prefix(service or ""))
+            _check_json_serializable(f"prompts[{i}]", prompt)
             if prompt["name"] in prompt_names:
                 raise ValueError(f"prompt {prompt['name']!r} declared twice")
             prompt_names.add(prompt["name"])
